@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import math
 from collections import OrderedDict
@@ -1461,10 +1462,8 @@ def build_router(deps: BotDependencies) -> Router:
 
         update = event.update
         if update.callback_query is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await update.callback_query.answer("Error occurred — see message.", show_alert=False)
-            except Exception:
-                pass
             if isinstance(update.callback_query.message, Message):
                 await update.callback_query.message.answer(reply_text)
         elif update.message is not None:
