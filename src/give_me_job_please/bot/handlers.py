@@ -87,6 +87,7 @@ from give_me_job_please.storage.repository import OfferRepository, UserStats
 logger = structlog.get_logger(__name__)
 
 _MAX_MESSAGE_CONTEXTS = 200
+_CV_PREVIEW_CHARS = 3500
 
 
 @dataclass(slots=True)
@@ -1086,12 +1087,19 @@ def build_router(deps: BotDependencies) -> Router:
             return
         profile = await deps.repo.get_or_create_profile(message.from_user.id)
         if profile.cv_text:
-            preview = esc(profile.cv_text[:500])
+            truncated = len(profile.cv_text) > _CV_PREVIEW_CHARS
+            note = (
+                f"Preview truncated to {_CV_PREVIEW_CHARS} chars; the full text stays encrypted at rest."
+                if truncated
+                else "Full extracted text below."
+            )
             await message.answer(
-                f"📄 <b>Current CV:</b> <code>{esc(profile.cv_filename)}</code> ({len(profile.cv_text)} chars)\n\n"
-                f"<i>Preview:</i>\n<code>{preview}...</code>\n\n"
+                f"📄 <b>Current CV:</b> <code>{esc(profile.cv_filename)}</code> ({len(profile.cv_text)} chars)\n"
+                f"{note}\n\n"
+                "The extracted text is in the next message as plain text — easy to copy and inspect.\n"
                 "Send a new <code>.pdf</code>, <code>.txt</code>, or <code>.md</code> file to replace it."
             )
+            await message.answer(profile.cv_text[:_CV_PREVIEW_CHARS], parse_mode=None)
         else:
             await message.answer(
                 "📄 No CV uploaded yet.\n"
