@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any, cast
 
 import numpy as np
-from sqlalchemy import func, select, update
+from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from give_me_job_please.core.auth.crypto import SecretBox
@@ -32,7 +33,7 @@ from give_me_job_please.storage.orm import (
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 # Marks a cv_text value as AES-256-GCM ciphertext rather than legacy plaintext.
@@ -507,14 +508,17 @@ class OfferRepository:
             return 0
         now = _utcnow()
         async with self._sessions() as session:
-            res = await session.execute(
-                update(UserOfferStateORM)
-                .where(
-                    UserOfferStateORM.user_id == user_id,
-                    UserOfferStateORM.offer_uid.in_(offer_uids),
-                    UserOfferStateORM.status == OfferStatus.NEW.value,
-                )
-                .values(status=OfferStatus.SEEN.value, updated_at=now)
+            res = cast(
+                CursorResult[Any],
+                await session.execute(
+                    update(UserOfferStateORM)
+                    .where(
+                        UserOfferStateORM.user_id == user_id,
+                        UserOfferStateORM.offer_uid.in_(offer_uids),
+                        UserOfferStateORM.status == OfferStatus.NEW.value,
+                    )
+                    .values(status=OfferStatus.SEEN.value, updated_at=now)
+                ),
             )
             await session.commit()
             return int(res.rowcount or 0)

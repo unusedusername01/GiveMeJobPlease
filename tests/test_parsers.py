@@ -52,7 +52,7 @@ SAMPLE_SHOWROOM_HTML = """<!DOCTYPE html>
 </html>
 """.encode("windows-1252")
 
-SAMPLE_REGISTRATIONS_HTML = """<!DOCTYPE html>
+SAMPLE_REGISTRATIONS_HTML = b"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"></head>
 <body>
@@ -74,7 +74,7 @@ SAMPLE_REGISTRATIONS_HTML = """<!DOCTYPE html>
 <div id="B999"></div>
 </body>
 </html>
-""".encode("utf-8")
+"""
 
 
 def test_showroom_detection_and_parsing() -> None:

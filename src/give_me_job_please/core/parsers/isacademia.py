@@ -169,11 +169,15 @@ class _GridTableExtractor(HTMLParser):
             href = attr_dict.get("href", "")
             onclick = attr_dict.get("onclick", "")
             self._current_cell["hrefs"] += f" {href} {onclick}"
-        elif tag == "img" and self._in_td and self._current_cell is not None:
-            if not self._current_cell["img_alt"]:
-                self._current_cell["img_alt"] = (
-                    attr_dict.get("infobulle") or attr_dict.get("alt") or ""
-                )
+        elif (
+            tag == "img"
+            and self._in_td
+            and self._current_cell is not None
+            and not self._current_cell["img_alt"]
+        ):
+            self._current_cell["img_alt"] = (
+                attr_dict.get("infobulle") or attr_dict.get("alt") or ""
+            )
 
     def handle_endtag(self, tag: str) -> None:
         if not self._in_target_table:
