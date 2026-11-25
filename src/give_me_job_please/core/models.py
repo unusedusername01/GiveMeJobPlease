@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -144,6 +145,7 @@ class EnrichedOffer(BaseModel):
     """Combined offer + user state + latest score for Telegram rendering and exports."""
 
     offer: JobOffer
+    first_seen_at: datetime | None = None
     status: OfferStatus = OfferStatus.NEW
     is_starred: bool = False
     score: float | None = None

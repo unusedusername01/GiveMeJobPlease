@@ -700,9 +700,10 @@ class OfferRepository:
             parser_version=offer_orm.parser_version,
         )
         if state_orm is None:
-            return EnrichedOffer(offer=offer)
+            return EnrichedOffer(offer=offer, first_seen_at=offer_orm.first_seen_at)
         return EnrichedOffer(
             offer=offer,
+            first_seen_at=offer_orm.first_seen_at,
             status=OfferStatus(state_orm.status),
             is_starred=bool(state_orm.is_starred),
             score=state_orm.score,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import structlog
@@ -16,13 +17,16 @@ from aiogram.types import BufferedInputFile, CallbackQuery, ErrorEvent, Message
 
 from give_me_job_please import __version__
 from give_me_job_please.bot.formatting import (
+    DigestQuery,
     build_offer_keyboard,
     build_pagination_keyboard,
     build_profile_keyboard,
     chunk_text,
+    decode_query_callback,
     esc,
     format_offer_card,
     format_profile_summary,
+    format_recency_label,
     format_threshold_label,
 )
 from give_me_job_please.config import Settings
@@ -34,7 +38,10 @@ from give_me_job_please.core.auth.openrouter_pkce import (
     verify_openrouter_model_exists,
 )
 from give_me_job_please.core.diff import (
+    PreScoringFilter,
+    apply_pre_scoring_filters,
     filter_by_min_score,
+    parse_digest_args,
     parse_min_score_threshold,
     sort_by_relevance,
 )
@@ -224,13 +231,12 @@ def build_router(deps: BotDependencies) -> Router:
     async def render_view_page(
         target_msg: Message,
         user_id: int,
-        view: str,
-        page: int,
+        query: DigestQuery,
         *,
-        force_local: bool = False,
         mark_new_as_seen: bool = False,
     ) -> None:
-        """Load, score (if needed), sort, and send a paginated list of offer cards."""
+        """Load, pre-filter (before LLM scoring), score, rank, and render a paginated view."""
+        view = query.view
         if view == "new":
             items = await deps.repo.list_enriched_offers(user_id, statuses={OfferStatus.NEW})
             title = "🆕 New Eligible Offers"
@@ -263,10 +269,14 @@ def build_router(deps: BotDependencies) -> Router:
             )
 
         stats = await deps.repo.get_user_stats(user_id)
+        profile = await deps.repo.get_or_create_profile(user_id)
         if not items:
             if view == "new" and stats.seen_count > 0:
                 kb = build_pagination_keyboard(
-                    view="new", page=0, total_pages=1, seen_count=stats.seen_count
+                    query=replace(query, page=0),
+                    total_pages=0,
+                    seen_count=stats.seen_count,
+                    profile_threshold=profile.min_score_threshold,
                 )
                 await target_msg.answer(
                     f"<b>{title}</b>\nNo brand-new offers waiting. "
@@ -279,17 +289,45 @@ def build_router(deps: BotDependencies) -> Router:
                 )
             return
 
+        # Pre-scoring filter pipeline: runs BEFORE OpenRouter/FastEmbed so excluded offers
+        # (e.g. outside the recency window) never consume paid LLM tokens.
+        total_before_pre_filter = len(items)
+        pre_filter = PreScoringFilter(
+            max_age_days=query.max_age_days,
+            recency_basis=query.recency_basis,
+        )
+        items = apply_pre_scoring_filters(items, pre_filter)
+        filtered_out_pre = total_before_pre_filter - len(items)
+
+        recency_label = format_recency_label(query.max_age_days, query.recency_basis)
+        if not items:
+            kb = build_pagination_keyboard(
+                query=replace(query, page=0),
+                total_pages=0,
+                seen_count=stats.seen_count,
+                profile_threshold=profile.min_score_threshold,
+            )
+            await target_msg.answer(
+                f"<b>{title}</b> · 📅 {esc(recency_label)}\n"
+                f"No offers matched the recency window "
+                f"(<b>{filtered_out_pre}</b> older offer(s) skipped before scoring).\n"
+                "Widen the range or switch Posted ⇄ Uploaded below.",
+                reply_markup=kb,
+            )
+            return
+
         status_notice = await target_msg.answer(f"⏳ Preparing <b>{len(items)}</b> offer(s)...")
         items, engine, model_id = await ensure_scored(
-            user_id, items, force_local=force_local, status_msg=status_notice
+            user_id, items, force_local=query.force_local, status_msg=status_notice
         )
         ranked = sort_by_relevance(items)
 
         # Apply the user's configured score threshold on discovery views only
         # (never hide starred/applied/excluded items the user explicitly tracks).
-        profile = await deps.repo.get_or_create_profile(user_id)
         active_threshold = (
-            profile.min_score_threshold if view in {"new", "all", "seen"} else None
+            profile.min_score_threshold
+            if (not query.ignore_threshold and view in {"new", "all", "seen"})
+            else None
         )
         total_before_threshold = len(ranked)
         if active_threshold is not None:
@@ -303,29 +341,44 @@ def build_router(deps: BotDependencies) -> Router:
         )
 
         if not ranked and active_threshold is not None:
+            kb = build_pagination_keyboard(
+                query=replace(query, page=0),
+                total_pages=0,
+                seen_count=stats.seen_count,
+                profile_threshold=profile.min_score_threshold,
+            )
             await status_notice.edit_text(
-                f"<b>{title}</b>\n"
+                f"<b>{title}</b> · 📅 {esc(recency_label)}\n"
                 f"No offers scored <b>≥ {active_threshold:g}/10</b> "
                 f"(<b>{hidden_below_threshold}</b> lower-scored offer(s) hidden).\n"
                 f"Engine: {engine_badge}\n\n"
-                "Lower or disable your cutoff with <code>/profile threshold off</code>."
+                "Tap below to show all scores, or update with <code>/profile threshold off</code>.",
+                reply_markup=kb,
             )
             return
 
         page_size = deps.settings.digest_page_size
         total_pages = max(1, math.ceil(len(ranked) / page_size))
-        page = max(0, min(page, total_pages - 1))
+        page = max(0, min(query.page, total_pages - 1))
+        active_query = replace(query, page=page)
         slice_items = ranked[page * page_size : (page + 1) * page_size]
 
-        threshold_note = ""
+        filter_notes: list[str] = []
+        if query.max_age_days is not None:
+            note = f"📅 {recency_label}"
+            if filtered_out_pre > 0:
+                note += f" ({filtered_out_pre} skipped)"
+            filter_notes.append(note)
         if active_threshold is not None:
-            threshold_note = f" · 🎯 ≥{active_threshold:g}"
+            note = f"🎯 ≥{active_threshold:g}"
             if hidden_below_threshold > 0:
-                threshold_note += f" ({hidden_below_threshold} hidden)"
+                note += f" ({hidden_below_threshold} hidden)"
+            filter_notes.append(note)
+        notes_suffix = f" · {' · '.join(filter_notes)}" if filter_notes else ""
 
         await status_notice.edit_text(
             f"<b>{title}</b> — showing <b>{len(slice_items)}</b> of <b>{len(ranked)}</b> "
-            f"(Page {page + 1}/{total_pages}){threshold_note}\nEngine: {engine_badge}"
+            f"(Page {page + 1}/{total_pages}){notes_suffix}\nEngine: {engine_badge}"
         )
 
         displayed_new_uids: list[str] = []
@@ -344,10 +397,10 @@ def build_router(deps: BotDependencies) -> Router:
         await target_msg.answer(
             f"Navigation ({title}):",
             reply_markup=build_pagination_keyboard(
-                view=view,
-                page=page,
+                query=active_query,
                 total_pages=total_pages,
                 seen_count=updated_stats.seen_count,
+                profile_threshold=profile.min_score_threshold,
             ),
         )
 
@@ -373,8 +426,8 @@ def build_router(deps: BotDependencies) -> Router:
             "<b>Commands:</b>\n"
             "/profile [edit|threshold &lt;val|off&gt;] — View or update preferences &amp; score threshold\n"
             "/cv — View/upload CV\n"
-            "/digest [local] — Ranked new offers (or force offline ONNX)\n"
-            "/browse [all|new|seen|starred|applied|excluded]\n"
+            "/digest [3d|7d|14d|30d|all] [posted|ingested] [local] — Ranked new offers (recency filters before LLM scoring)\n"
+            "/browse [all|new|seen|starred|applied|excluded] [7d] [ingested]\n"
             "/connect_openrouter [limit] [expiration] — OAuth PKCE\n"
             "/auth &lt;code&gt; — Complete PKCE (message auto-deleted)\n"
             "/model [query_or_id] — Pick OpenRouter model\n"
@@ -763,14 +816,17 @@ def build_router(deps: BotDependencies) -> Router:
     async def cmd_digest(message: Message, command: CommandObject) -> None:
         if message.from_user is None:
             return
-        args = (command.args or "").strip().lower()
-        force_local = "local" in args
+        parsed = parse_digest_args(command.args or "")
         await render_view_page(
             message,
             message.from_user.id,
-            view="new",
-            page=0,
-            force_local=force_local,
+            DigestQuery(
+                view="new",
+                page=0,
+                max_age_days=parsed.max_age_days,
+                recency_basis=parsed.recency_basis,
+                force_local=parsed.force_local,
+            ),
             mark_new_as_seen=True,
         )
 
@@ -779,16 +835,33 @@ def build_router(deps: BotDependencies) -> Router:
         if message.from_user is None:
             return
         cmd_name = (command.command or "browse").lower()
+        raw_args = (command.args or "").strip()
         if cmd_name in {"starred", "seen", "applied", "excluded"}:
             view = cmd_name
+            extra_args = raw_args
         else:
-            view = (command.args or "all").strip().lower().split()[0]
+            parts = raw_args.split(None, 1)
+            if not parts:
+                view = "all"
+                extra_args = ""
+            elif parts[0].lower() in {"all", "new", "seen", "starred", "applied", "excluded"}:
+                view = parts[0].lower()
+                extra_args = parts[1] if len(parts) > 1 else ""
+            else:
+                # Allow shorthand like `/browse 7d` (defaults view to 'all')
+                view = "all"
+                extra_args = raw_args
+        parsed = parse_digest_args(extra_args)
         await render_view_page(
             message,
             message.from_user.id,
-            view=view,
-            page=0,
-            force_local=False,
+            DigestQuery(
+                view=view,
+                page=0,
+                max_age_days=parsed.max_age_days,
+                recency_basis=parsed.recency_basis,
+                force_local=parsed.force_local,
+            ),
             mark_new_as_seen=(view in {"new", "all"}),
         )
 
@@ -959,19 +1032,14 @@ def build_router(deps: BotDependencies) -> Router:
     async def cb_paginate(callback: CallbackQuery) -> None:
         if callback.from_user is None or callback.message is None or not callback.data:
             return
-        _, view, raw_page = callback.data.split(":", 2)
+        _, query, _ = decode_query_callback(callback.data)
         await callback.answer()
-        try:
-            page = max(0, int(raw_page))
-        except ValueError as exc:
-            raise ValidationError("Invalid pagination data. Please run the command again.") from exc
         if isinstance(callback.message, Message):
             await render_view_page(
                 callback.message,
                 callback.from_user.id,
-                view=view,
-                page=page,
-                mark_new_as_seen=(view in {"new", "all"}),
+                query,
+                mark_new_as_seen=(query.view in {"new", "all"}),
             )
 
     @router.callback_query(F.data.startswith("o:"))

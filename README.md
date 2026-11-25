@@ -79,8 +79,8 @@ uv run mypy src
 - `/start` — Verify access & show quick help
 - `/profile` — View current preferences & score threshold (`/profile edit` for the guided wizard, `/profile threshold <0-10|off>` for quick cutoff updates)
 - `/cv` — Upload a `.pdf`, `.txt`, or `.md` CV (or drop it directly in chat) — **anonymised only**
-- `/digest` — Score & view `new` offers (`/digest local` forces offline Mode A)
-- `/browse [all|new|seen|starred|applied|excluded]` — Browse offers sorted by relevance
+- `/digest [3d|7d|14d|30d|all] [posted|ingested] [local]` — Score & view `new` offers; recency filtering runs **before** OpenRouter/local scoring so older offers do not consume LLM tokens (`posted` filters by IS-Academia posting date with fallback to upload date; `ingested` filters by bot upload date; `local` forces offline Mode A). *(Designed as an extensible pre-LLM filter stage for future rules like salary or company filters.)*
+- `/browse [all|new|seen|starred|applied|excluded] [7d] [posted|ingested]` — Browse offers sorted by relevance with optional recency filtering
 - `/connect_openrouter [limit] [expiration]` — Start headless OAuth PKCE flow
 - `/auth <code>` — Exchange code for a scoped OpenRouter key (message is auto-deleted)
 - `/model [search_or_id]` — Search OpenRouter catalog or select active model
