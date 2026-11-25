@@ -263,6 +263,10 @@ class OpenRouterScorer:
                     kwargs["response_format"] = {"type": "json_object"}
                 response = await client.chat.send_async(**kwargs)
                 return _extract_message_text(response)
+            except asyncio.CancelledError:
+                # User-initiated cancellation must never be retried or wrapped as a
+                # ScorerError; propagate so the run unwinds and checkpoints stand.
+                raise
             except Exception as exc:
                 status = self._extract_status_code(exc)
                 err_str = str(exc)

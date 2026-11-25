@@ -20,6 +20,8 @@ logger = structlog.get_logger(__name__)
 
 LOCAL_PROMPT_VERSION = "fastembed_cosine:1.0"
 
+_EMBED_CHUNK_SIZE = 64
+
 
 def vector_to_bytes(vec: np.ndarray) -> bytes:
     """Serialize a 1D float32 numpy vector for SQLite BLOB storage."""
@@ -80,17 +82,30 @@ class LocalEmbedderScorer:
             return self._model
 
     async def embed_texts(self, texts: list[str]) -> list[np.ndarray]:
-        """Embed a batch of texts off the asyncio event loop."""
+        """Embed texts off the event loop in chunks so cancellation lands between chunks.
+
+        An in-flight ONNX chunk runs in a worker thread and cannot be killed; it finishes,
+        then a pending cancellation is honoured before the next chunk starts.
+        """
         if not texts:
             return []
         model = await self._get_model()
 
-        def _run() -> list[np.ndarray]:
+        def _run(chunk: list[str]) -> list[np.ndarray]:
             # fastembed returns a generator of 1D float32 arrays
-            return [np.asarray(v, dtype=np.float32) for v in model.embed(texts)]  # type: ignore[attr-defined]
+            return [np.asarray(v, dtype=np.float32) for v in model.embed(chunk)]  # type: ignore[attr-defined]
 
+        results: list[np.ndarray] = []
         try:
-            return await asyncio.to_thread(_run)
+            for start in range(0, len(texts), _EMBED_CHUNK_SIZE):
+                # Cancellation checkpoint: yield to the loop so a task.cancel() issued
+                # while the previous chunk ran in the thread is delivered here.
+                await asyncio.sleep(0)
+                chunk = texts[start : start + _EMBED_CHUNK_SIZE]
+                results.extend(await asyncio.to_thread(_run, chunk))
+            return results
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             raise ScorerError(
                 "Local embedding computation failed. Please inspect /logs.",
