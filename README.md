@@ -1,0 +1,56 @@
+# GiveMeJobPlease (V1)
+
+Personal, self-hosted Telegram bot for parsing, tracking, and ranking **EPFL IS-Academia** internship exports.
+
+## Highlights
+- **Zero-Scraping, Drop-to-Bot Workflow:** Hit `Ctrl+S` on IS-Academia (`Internships showroom (stu).htm` or `Registrations (stu).htm`) and drop the file into your Telegram bot chat.
+- **Pipeline-Ready State Machine:** Tracks `new`, `seen`, `applied`, and `excluded` offers plus an independent `⭐ Star` flag. Eligible pool is always `Current Showroom - Applied - Excluded`, with one-tap toggles to revisit `seen`, `starred`, `applied`, or `excluded` offers.
+- **Profile + CV Context:** Guided `/profile` wizard plus `.pdf` / `.txt` / `.md` CV extraction.
+- **Dual Scoring Engine:**
+  - **Mode B (Primary when connected):** Connect OpenRouter via secure headless **OAuth PKCE** (`/connect_openrouter` → `/auth <code>`) to score offers with DeepSeek, Qwen, or any OpenRouter model. Completely overrides local embeddings.
+  - **Mode A (Default without API key):** Runs local multilingual ONNX embeddings (`fastembed`) on CPU with zero API keys and displays all eligible matches ranked by cosine similarity.
+- **Observability & Versioning:** Every update gets a `trace_id`, secrets are automatically redacted from logs, SQLite migrations run via Alembic with pre-migration backups, and stale scores auto-invalidate via `scoring_fingerprint`.
+
+## Quick Start (Docker — Recommended for Infomaniak VM)
+
+1. Copy `.env.example` to `.env` and fill in `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_IDS`, and a generated `ENCRYPTION_KEY`:
+   ```bash
+   cp .env.example .env
+   python3 -c "import os, base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+   ```
+2. Launch with Docker Compose (zero inbound ports required — uses outbound Telegram long-polling):
+   ```bash
+   docker compose up -d --build
+   docker compose logs -f
+   ```
+
+## Local Development (`uv`)
+
+```bash
+uv sync --extra dev
+cp .env.example .env
+# Edit .env, then run migrations and start:
+uv run alembic upgrade head
+uv run give-me-job-please
+```
+
+Run tests, linter, and type checker:
+```bash
+uv run pytest
+uv run ruff check src tests
+uv run mypy src
+```
+
+## Telegram Commands
+- `/start` — Verify access & show quick help
+- `/profile` — Guided preference setup (roles, locations, formats, dealbreakers)
+- `/cv` — Upload a `.pdf`, `.txt`, or `.md` CV (or drop it directly in chat)
+- `/digest` — Score & view `new` offers (`/digest local` forces offline Mode A)
+- `/browse [all|new|seen|starred|applied|excluded]` — Browse offers sorted by relevance
+- `/connect_openrouter [limit] [expiration]` — Start headless OAuth PKCE flow
+- `/auth <code>` — Exchange code for a scoped OpenRouter key (message is auto-deleted)
+- `/model [search_or_id]` — Search OpenRouter catalog or select active model
+- `/disconnect_openrouter` — Wipe stored key and revert to Mode A
+- `/export` — Receive enriched `internships.csv` + `internships_descriptions.json`
+- `/status` — Show versions, active scorer, DB counts, and OpenRouter key links
+- `/logs` — Show the last 5 traced error entries

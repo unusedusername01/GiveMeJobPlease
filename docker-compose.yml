@@ -1,0 +1,27 @@
+services:
+  give-me-job-please:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: give-me-job-please-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////app/data/give_me_job_please.db
+      LOG_DIR: /app/data/logs
+      FASTEMBED_CACHE_PATH: /app/data/model_cache
+    volumes:
+      - ./data:/app/data
+    mem_limit: 1536m
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, sqlite3; p='/app/data/give_me_job_please.db'; assert os.path.exists(p); sqlite3.connect(p).execute('SELECT 1')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

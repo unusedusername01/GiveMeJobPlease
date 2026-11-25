@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Secrets & local runtime data
+.env
+data/
+*.db
+*.db-shm
+*.db-wal
+*.htm
+*.html
+!tests/fixtures/*.htm

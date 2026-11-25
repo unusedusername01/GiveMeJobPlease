@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "give-me-job-please"
+version = "0.1.0"
+description = "Personal Telegram bot for parsing, tracking, and ranking EPFL IS-Academia internships (Local ONNX Embeddings + OpenRouter OAuth PKCE)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "aiogram>=3.15.0,<4.0.0",
+    "aiosqlite>=0.20.0",
+    "alembic>=1.14.0",
+    "cryptography>=44.0.0",
+    "fastembed>=0.5.0",
+    "httpx>=0.28.0",
+    "numpy>=1.26.0",
+    "openrouter>=0.4.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "pypdf>=5.1.0",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "structlog>=24.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.14.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "ruff>=0.8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/unusedusername01/GiveMeJobPlease"
+
+[project.scripts]
+give-me-job-please = "give_me_job_please.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/give_me_job_please"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

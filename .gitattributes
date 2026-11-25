@@ -1,0 +1,4 @@
+* text=auto
+
+# Keep shell scripts LF so the Docker entrypoint stays executable on Linux
+*.sh text eol=lf
