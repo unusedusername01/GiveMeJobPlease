@@ -32,6 +32,7 @@ from give_me_job_please.bot.formatting import (
     build_offer_keyboard,
     build_pagination_keyboard,
     build_profile_keyboard,
+    build_scoring_cancel_keyboard,
     decode_query_callback,
     esc,
     format_digest_list,
@@ -95,6 +96,14 @@ class DigestMessageContext:
 
 
 @dataclass(slots=True)
+class _ScoringProgress:
+    """Mutable per-run counters shared with the checkpoint closure for cancel summaries."""
+
+    total: int = 0
+    scored: int = 0
+
+
+@dataclass(slots=True)
 class _PreparedDigest:
     title: str
     ranked: list[EnrichedOffer]
@@ -152,6 +161,8 @@ class BotDependencies:
         self.error_log_path = error_log_path
         # One lock per user: prevents duplicate concurrent scoring runs (and billing).
         self.scoring_locks: dict[int, asyncio.Lock] = {}
+        # Active scoring task per user, so /cancel or the 🛑 button can abort a run.
+        self.scoring_tasks: dict[int, asyncio.Task[None]] = {}
         # Bounded LRU mapping (chat_id, message_id) -> DigestMessageContext for in-place UX.
         self.digest_contexts: OrderedDict[tuple[int, int], DigestMessageContext] = OrderedDict()
 
@@ -194,12 +205,34 @@ def build_router(deps: BotDependencies) -> Router:
         if lock.locked():
             raise ValidationError(
                 "A scoring run is already in progress for your account. "
-                "Please wait for it to finish before retrying."
+                "Please wait for it to finish, or send /cancel to stop it."
             )
-        async with lock:
-            return await _ensure_scored_unlocked(
-                user_id, items, force_local=force_local, status_msg=status_msg
-            )
+        progress = _ScoringProgress()
+        task = asyncio.current_task()
+        if task is not None:
+            deps.scoring_tasks[user_id] = task
+        try:
+            async with lock:
+                return await _ensure_scored_unlocked(
+                    user_id,
+                    items,
+                    force_local=force_local,
+                    status_msg=status_msg,
+                    progress=progress,
+                )
+        except asyncio.CancelledError:
+            if status_msg is not None:
+                with contextlib.suppress(Exception):
+                    await _safe_edit_text(
+                        status_msg,
+                        f"🛑 <b>Scoring cancelled</b> — {progress.scored} of {progress.total} "
+                        "offer(s) scored and saved.\n"
+                        "Run /digest again to resume: only unscored offers are re-billed.",
+                    )
+            raise
+        finally:
+            if deps.scoring_tasks.get(user_id) is task:
+                deps.scoring_tasks.pop(user_id, None)
 
     async def _ensure_scored_unlocked(
         user_id: int,
@@ -207,6 +240,7 @@ def build_router(deps: BotDependencies) -> Router:
         *,
         force_local: bool = False,
         status_msg: Message | None = None,
+        progress: _ScoringProgress | None = None,
     ) -> tuple[list[EnrichedOffer], str, str]:
         """
         Score any offers whose cached `scoring_fingerprint` does not match the active setup.
@@ -235,14 +269,18 @@ def build_router(deps: BotDependencies) -> Router:
 
         to_score = [item.offer for item in items if item.scoring_fingerprint != fingerprint]
         if to_score:
+            if progress is not None:
+                progress.total = len(to_score)
             if status_msg is not None:
                 mode_str = (
                     f"OpenRouter (<code>{esc(model_id)}</code>)"
                     if engine == "openrouter"
                     else f"Local ONNX (<code>{esc(model_id)}</code>)"
                 )
-                await status_msg.edit_text(
-                    f"⏳ Scoring <b>{len(to_score)}</b> offer(s) using {mode_str}..."
+                await _safe_edit_text(
+                    status_msg,
+                    f"⏳ Scoring <b>{len(to_score)}</b> offer(s) using {mode_str}...",
+                    reply_markup=build_scoring_cancel_keyboard(),
                 )
 
             if engine == "openrouter" and or_state.key_enc:
@@ -259,8 +297,10 @@ def build_router(deps: BotDependencies) -> Router:
 
                 async def _checkpoint(batch_scores: list[OfferScore]) -> None:
                     # Persist each completed batch immediately: a later batch failure
-                    # must not discard (and re-bill) batches that already succeeded.
+                    # or cancellation must not discard (and re-bill) finished batches.
                     await deps.repo.save_scores(user_id, batch_scores)
+                    if progress is not None:
+                        progress.scored += len(batch_scores)
 
                 new_scores = await scorer.score_offers(
                     profile, to_score, fingerprint, on_batch_complete=_checkpoint
@@ -284,6 +324,8 @@ def build_router(deps: BotDependencies) -> Router:
                     profile_vec=updated_prof_vec,
                     new_offer_vecs=newly_embedded,
                 )
+                if progress is not None:
+                    progress.scored = len(new_scores)
 
             await deps.repo.save_scores(user_id, new_scores)
             score_map = {s.offer_uid: s for s in new_scores}
@@ -617,6 +659,7 @@ def build_router(deps: BotDependencies) -> Router:
             "/model [query_or_id] — Pick OpenRouter model\n"
             "/disconnect_openrouter — Remove stored key\n"
             "/export — Download enriched CSV + JSON\n"
+            "/cancel — Stop an active scoring run (saved batches kept) or exit setup\n"
             "/status — System & DB overview\n"
             "/logs — Recent traced errors"
         )
@@ -696,8 +739,30 @@ def build_router(deps: BotDependencies) -> Router:
 
     @router.message(Command("cancel"))
     async def cmd_cancel(message: Message, state: FSMContext) -> None:
+        if message.from_user is None:
+            return
         await state.clear()
+        task = deps.scoring_tasks.get(message.from_user.id)
+        if task is not None and not task.done():
+            task.cancel()
+            # The cancelled run edits its own status message with the saved-progress summary.
+            await message.answer(
+                "🛑 Cancelling the active scoring run… "
+                "Completed batches are already saved; /digest resumes where it stopped."
+            )
+            return
         await message.answer("Cancelled current setup flow.")
+
+    @router.callback_query(F.data == "sc:cancel")
+    async def cb_scoring_cancel(callback: CallbackQuery) -> None:
+        if callback.from_user is None:
+            return
+        task = deps.scoring_tasks.get(callback.from_user.id)
+        if task is None or task.done():
+            await callback.answer("No scoring run in progress.", show_alert=False)
+            return
+        task.cancel()
+        await callback.answer("Cancelling… completed batches are saved.", show_alert=False)
 
     async def _start_profile_wizard(target_msg: Message, user_id: int, state: FSMContext) -> None:
         profile = await deps.repo.get_or_create_profile(user_id)

@@ -516,6 +516,15 @@ def build_filter_rows(
     return rows
 
 
+def build_scoring_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Single cancel button shown on the in-progress scoring status message."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🛑 Cancel scoring", callback_data="sc:cancel")]
+        ]
+    )
+
+
 def build_pagination_keyboard(
     *,
     query: DigestQuery,
