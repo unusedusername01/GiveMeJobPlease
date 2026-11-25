@@ -5,7 +5,8 @@ Personal, self-hosted Telegram bot for parsing, tracking, and ranking **EPFL IS-
 ## Highlights
 - **Zero-Scraping, Drop-to-Bot Workflow:** Hit `Ctrl+S` on IS-Academia (`Internships showroom (stu).htm` or `Registrations (stu).htm`) and drop the file into your Telegram bot chat.
 - **Pipeline-Ready State Machine:** Tracks `new`, `seen`, `applied`, and `excluded` offers plus an independent `⭐ Star` flag. Eligible pool is always `Current Showroom - Applied - Excluded`, with one-tap toggles to revisit `seen`, `starred`, `applied`, or `excluded` offers.
-- **Profile + CV Context:** Guided `/profile` wizard plus `.pdf` / `.txt` / `.md` CV extraction. **Upload an anonymised CV only** — see [Data Handling & CV Privacy Policy](#data-handling--cv-privacy-policy).
+- **In-Place Single-Message Telegram UX:** `/digest` and `/browse` render a compact ranked list in a single message edited in-place across **List → Offer Card → Paginated Full Description** (with `Star / Apply / Exclude` directly available in every view), marking `new` offers as `seen` on open or via `👀 Mark page seen` so pagination never skips offers.
+- **Profile + CV Context:** Viewable `/profile` summary with a 5-step guided wizard (including a post-scoring min score threshold that never triggers paid re-scoring) plus `.pdf` / `.txt` / `.md` CV extraction. **Upload an anonymised CV only** — see [Data Handling & CV Privacy Policy](#data-handling--cv-privacy-policy).
 - **Dual Scoring Engine:**
   - **Mode B (Primary when connected):** Connect OpenRouter via secure headless **OAuth PKCE** (`/connect_openrouter` → `/auth <code>`) to score offers with DeepSeek, Qwen, or any OpenRouter model. Completely overrides local embeddings.
   - **Mode A (Default without API key):** Runs local multilingual ONNX embeddings (`fastembed`) on CPU with zero API keys and displays all eligible matches ranked by cosine similarity.

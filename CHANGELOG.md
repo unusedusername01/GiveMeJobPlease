@@ -26,6 +26,9 @@ This project follows [Semantic Versioning](https://semver.org/).
 - PDF CV parsing rejects documents over 20 pages, and parsers run off the event loop.
 - `TELEGRAM_ALLOWED_USER_IDS` must be non-empty (fail fast at startup).
 ### Added
+- `/profile` settings summary view with inline actions, `/profile edit`, `/profile threshold <0-10|off>`, and Step 5/5 (`min_score_threshold`, persisted via reversible Alembic migration `0002_add_min_score_threshold`) excluded from `profile_hash` so cutoff edits never trigger paid re-scoring.
+- Pre-scoring recency filtering for `/digest` and `/browse` (`3d`, `7d`, `14d`, `30d`, `all`) running **before** OpenRouter/local scoring, defaulting to IS-Academia posting date (`creation_date`, falling back to `first_seen_at`) with CLI and inline toggles to upload date (`first_seen_at`), structured as an extensible pre-LLM filter pipeline.
+- Single-message in-place Telegram UX for `/digest` and `/browse`: compact ranked list with numbered `[1]..[N]` drill-down, contextual `Prev / Next / Back to list` card navigation, paginated in-place full descriptions with direct `Star / Apply / Exclude` actions, and `seen` tracking on open or via `👀 Mark page seen` (eliminating `new`-view page skipping).
 - README "Data Handling & CV Privacy Policy": upload an anonymised CV (mock name, email,
   phone, address) and a table of every destination the CV text can reach.
 

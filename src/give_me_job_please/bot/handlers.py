@@ -5,26 +5,37 @@ from __future__ import annotations
 import asyncio
 import io
 import math
-from dataclasses import replace
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import structlog
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, ErrorEvent, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    ErrorEvent,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from give_me_job_please import __version__
 from give_me_job_please.bot.formatting import (
     DigestQuery,
+    build_description_keyboard,
+    build_digest_list_keyboard,
     build_offer_keyboard,
     build_pagination_keyboard,
     build_profile_keyboard,
-    chunk_text,
     decode_query_callback,
     esc,
+    format_digest_list,
     format_offer_card,
+    format_offer_description_page,
     format_profile_summary,
     format_recency_label,
     format_threshold_label,
@@ -46,7 +57,7 @@ from give_me_job_please.core.diff import (
     sort_by_relevance,
 )
 from give_me_job_please.core.exporter import export_csv_bytes, export_descriptions_json_bytes
-from give_me_job_please.core.models import EnrichedOffer, OfferScore, OfferStatus
+from give_me_job_please.core.models import EnrichedOffer, OfferScore, OfferStatus, UserProfile
 from give_me_job_please.core.parsers.cv_parser import parse_cv_bytes
 from give_me_job_please.core.parsers.isacademia import (
     REGISTRATIONS_PARSER_VERSION,
@@ -66,9 +77,48 @@ from give_me_job_please.core.scoring.openrouter_scorer import (
 )
 from give_me_job_please.errors import AppError, AuthError, ParseError, ValidationError
 from give_me_job_please.logging_setup import read_recent_error_logs
-from give_me_job_please.storage.repository import OfferRepository
+from give_me_job_please.storage.repository import OfferRepository, UserStats
 
 logger = structlog.get_logger(__name__)
+
+_MAX_MESSAGE_CONTEXTS = 200
+
+
+@dataclass(slots=True)
+class DigestMessageContext:
+    """In-memory snapshot for smooth in-place Prev/Next card navigation (with stateless fallback)."""
+
+    query: DigestQuery
+    ordered_uids: list[str]
+    page_size: int
+
+
+@dataclass(slots=True)
+class _PreparedDigest:
+    title: str
+    ranked: list[EnrichedOffer]
+    total_before_pre_filter: int
+    filtered_out_pre: int
+    active_threshold: float | None
+    hidden_below_threshold: int
+    engine: str
+    model_id: str
+    profile: UserProfile
+    stats: UserStats
+
+
+async def _safe_edit_text(
+    msg: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    """Edit a Telegram message in-place, ignoring harmless 'message is not modified' errors."""
+    try:
+        await msg.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return
+        raise
 
 
 class ProfileWizard(StatesGroup):
@@ -101,6 +151,26 @@ class BotDependencies:
         self.error_log_path = error_log_path
         # One lock per user: prevents duplicate concurrent scoring runs (and billing).
         self.scoring_locks: dict[int, asyncio.Lock] = {}
+        # Bounded LRU mapping (chat_id, message_id) -> DigestMessageContext for in-place UX.
+        self.digest_contexts: OrderedDict[tuple[int, int], DigestMessageContext] = OrderedDict()
+
+    def set_digest_context(
+        self, chat_id: int, message_id: int, ctx: DigestMessageContext
+    ) -> None:
+        key = (chat_id, message_id)
+        self.digest_contexts[key] = ctx
+        self.digest_contexts.move_to_end(key)
+        while len(self.digest_contexts) > _MAX_MESSAGE_CONTEXTS:
+            self.digest_contexts.popitem(last=False)
+
+    def get_digest_context(
+        self, chat_id: int, message_id: int
+    ) -> DigestMessageContext | None:
+        key = (chat_id, message_id)
+        ctx = self.digest_contexts.get(key)
+        if ctx is not None:
+            self.digest_contexts.move_to_end(key)
+        return ctx
 
 
 def build_router(deps: BotDependencies) -> Router:
@@ -228,14 +298,13 @@ def build_router(deps: BotDependencies) -> Router:
 
         return items, engine, model_id
 
-    async def render_view_page(
-        target_msg: Message,
+    async def _prepare_digest_data(
         user_id: int,
         query: DigestQuery,
         *,
-        mark_new_as_seen: bool = False,
-    ) -> None:
-        """Load, pre-filter (before LLM scoring), score, rank, and render a paginated view."""
+        status_msg: Message | None = None,
+    ) -> _PreparedDigest:
+        """Load view offers, apply pre-scoring recency filters, score, rank, and apply threshold."""
         view = query.view
         if view == "new":
             items = await deps.repo.list_enriched_offers(user_id, statuses={OfferStatus.NEW})
@@ -270,57 +339,38 @@ def build_router(deps: BotDependencies) -> Router:
 
         stats = await deps.repo.get_user_stats(user_id)
         profile = await deps.repo.get_or_create_profile(user_id)
-        if not items:
-            if view == "new" and stats.seen_count > 0:
-                kb = build_pagination_keyboard(
-                    query=replace(query, page=0),
-                    total_pages=0,
-                    seen_count=stats.seen_count,
-                    profile_threshold=profile.min_score_threshold,
-                )
-                await target_msg.answer(
-                    f"<b>{title}</b>\nNo brand-new offers waiting. "
-                    f"You have <b>{stats.seen_count}</b> seen eligible offer(s).",
-                    reply_markup=kb,
-                )
-            else:
-                await target_msg.answer(
-                    f"<b>{title}</b>\nNothing here yet. Drop an IS-Academia <code>.htm</code> export anytime."
-                )
-            return
+        total_before_pre_filter = len(items)
 
         # Pre-scoring filter pipeline: runs BEFORE OpenRouter/FastEmbed so excluded offers
         # (e.g. outside the recency window) never consume paid LLM tokens.
-        total_before_pre_filter = len(items)
         pre_filter = PreScoringFilter(
             max_age_days=query.max_age_days,
             recency_basis=query.recency_basis,
         )
-        items = apply_pre_scoring_filters(items, pre_filter)
-        filtered_out_pre = total_before_pre_filter - len(items)
+        filtered_items = apply_pre_scoring_filters(items, pre_filter)
+        filtered_out_pre = total_before_pre_filter - len(filtered_items)
 
-        recency_label = format_recency_label(query.max_age_days, query.recency_basis)
-        if not items:
-            kb = build_pagination_keyboard(
-                query=replace(query, page=0),
-                total_pages=0,
-                seen_count=stats.seen_count,
-                profile_threshold=profile.min_score_threshold,
+        if not filtered_items:
+            return _PreparedDigest(
+                title=title,
+                ranked=[],
+                total_before_pre_filter=total_before_pre_filter,
+                filtered_out_pre=filtered_out_pre,
+                active_threshold=None,
+                hidden_below_threshold=0,
+                engine="",
+                model_id="",
+                profile=profile,
+                stats=stats,
             )
-            await target_msg.answer(
-                f"<b>{title}</b> · 📅 {esc(recency_label)}\n"
-                f"No offers matched the recency window "
-                f"(<b>{filtered_out_pre}</b> older offer(s) skipped before scoring).\n"
-                "Widen the range or switch Posted ⇄ Uploaded below.",
-                reply_markup=kb,
-            )
-            return
 
-        status_notice = await target_msg.answer(f"⏳ Preparing <b>{len(items)}</b> offer(s)...")
-        items, engine, model_id = await ensure_scored(
-            user_id, items, force_local=query.force_local, status_msg=status_notice
+        scored_items, engine, model_id = await ensure_scored(
+            user_id,
+            filtered_items,
+            force_local=query.force_local,
+            status_msg=status_msg,
         )
-        ranked = sort_by_relevance(items)
+        ranked = sort_by_relevance(scored_items)
 
         # Apply the user's configured score threshold on discovery views only
         # (never hide starred/applied/excluded items the user explicitly tracks).
@@ -334,23 +384,95 @@ def build_router(deps: BotDependencies) -> Router:
             ranked = filter_by_min_score(ranked, active_threshold)
         hidden_below_threshold = total_before_threshold - len(ranked)
 
-        engine_badge = (
-            f"🤖 OpenRouter (<code>{esc(model_id)}</code>)"
-            if engine == "openrouter"
-            else f"🧠 Local ONNX (<code>{esc(model_id)}</code>)"
+        return _PreparedDigest(
+            title=title,
+            ranked=ranked,
+            total_before_pre_filter=total_before_pre_filter,
+            filtered_out_pre=filtered_out_pre,
+            active_threshold=active_threshold,
+            hidden_below_threshold=hidden_below_threshold,
+            engine=engine,
+            model_id=model_id,
+            profile=profile,
+            stats=stats,
         )
 
-        if not ranked and active_threshold is not None:
+    async def render_view_page(
+        target_msg: Message,
+        user_id: int,
+        query: DigestQuery,
+        *,
+        edit_in_place: bool = False,
+    ) -> None:
+        """Render the compact digest list into a single message (created once, then edited in-place)."""
+        display_msg = (
+            target_msg
+            if edit_in_place
+            else await target_msg.answer("⏳ Preparing offers...")
+        )
+
+        prepared = await _prepare_digest_data(
+            user_id,
+            query,
+            status_msg=display_msg,
+        )
+
+        recency_label = format_recency_label(query.max_age_days, query.recency_basis)
+        if prepared.total_before_pre_filter == 0:
+            if query.view == "new" and prepared.stats.seen_count > 0:
+                kb = build_pagination_keyboard(
+                    query=replace(query, page=0),
+                    total_pages=0,
+                    seen_count=prepared.stats.seen_count,
+                    profile_threshold=prepared.profile.min_score_threshold,
+                )
+                await _safe_edit_text(
+                    display_msg,
+                    f"<b>{prepared.title}</b>\nNo brand-new offers waiting. "
+                    f"You have <b>{prepared.stats.seen_count}</b> seen eligible offer(s).",
+                    reply_markup=kb,
+                )
+            else:
+                await _safe_edit_text(
+                    display_msg,
+                    f"<b>{prepared.title}</b>\nNothing here yet. Drop an IS-Academia <code>.htm</code> export anytime.",
+                )
+            return
+
+        if not prepared.ranked and prepared.filtered_out_pre == prepared.total_before_pre_filter:
             kb = build_pagination_keyboard(
                 query=replace(query, page=0),
                 total_pages=0,
-                seen_count=stats.seen_count,
-                profile_threshold=profile.min_score_threshold,
+                seen_count=prepared.stats.seen_count,
+                profile_threshold=prepared.profile.min_score_threshold,
             )
-            await status_notice.edit_text(
-                f"<b>{title}</b> · 📅 {esc(recency_label)}\n"
-                f"No offers scored <b>≥ {active_threshold:g}/10</b> "
-                f"(<b>{hidden_below_threshold}</b> lower-scored offer(s) hidden).\n"
+            await _safe_edit_text(
+                display_msg,
+                f"<b>{prepared.title}</b> · 📅 {esc(recency_label)}\n"
+                f"No offers matched the recency window "
+                f"(<b>{prepared.filtered_out_pre}</b> older offer(s) skipped before scoring).\n"
+                "Widen the range or switch Posted ⇄ Uploaded below.",
+                reply_markup=kb,
+            )
+            return
+
+        if not prepared.ranked and prepared.active_threshold is not None:
+            engine_badge = (
+                f"🤖 OpenRouter (<code>{esc(prepared.model_id)}</code>)"
+                if prepared.engine == "openrouter"
+                else f"🧠 Local ONNX (<code>{esc(prepared.model_id)}</code>)"
+            )
+            kb = build_pagination_keyboard(
+                query=replace(query, page=0),
+                total_pages=0,
+                seen_count=prepared.stats.seen_count,
+                profile_threshold=prepared.profile.min_score_threshold,
+            )
+            await _safe_edit_text(
+                display_msg,
+                f"<b>{prepared.title}</b> · 📅 {esc(recency_label)}\n"
+                f"No offers scored <b>≥ {prepared.active_threshold:g}/10</b> "
+                f"(<b>{prepared.hidden_below_threshold}</b> lower-scored offer(s) hidden).\n"
                 f"Engine: {engine_badge}\n\n"
                 "Tap below to show all scores, or update with <code>/profile threshold off</code>.",
                 reply_markup=kb,
@@ -358,51 +480,112 @@ def build_router(deps: BotDependencies) -> Router:
             return
 
         page_size = deps.settings.digest_page_size
-        total_pages = max(1, math.ceil(len(ranked) / page_size))
+        total_pages = max(1, math.ceil(len(prepared.ranked) / page_size))
         page = max(0, min(query.page, total_pages - 1))
         active_query = replace(query, page=page)
-        slice_items = ranked[page * page_size : (page + 1) * page_size]
+        slice_items = prepared.ranked[page * page_size : (page + 1) * page_size]
 
-        filter_notes: list[str] = []
-        if query.max_age_days is not None:
-            note = f"📅 {recency_label}"
-            if filtered_out_pre > 0:
-                note += f" ({filtered_out_pre} skipped)"
-            filter_notes.append(note)
-        if active_threshold is not None:
-            note = f"🎯 ≥{active_threshold:g}"
-            if hidden_below_threshold > 0:
-                note += f" ({hidden_below_threshold} hidden)"
-            filter_notes.append(note)
-        notes_suffix = f" · {' · '.join(filter_notes)}" if filter_notes else ""
-
-        await status_notice.edit_text(
-            f"<b>{title}</b> — showing <b>{len(slice_items)}</b> of <b>{len(ranked)}</b> "
-            f"(Page {page + 1}/{total_pages}){notes_suffix}\nEngine: {engine_badge}"
-        )
-
-        displayed_new_uids: list[str] = []
-        for item in slice_items:
-            await target_msg.answer(
-                format_offer_card(item),
-                reply_markup=build_offer_keyboard(item),
-            )
-            if item.status == OfferStatus.NEW:
-                displayed_new_uids.append(item.offer.uid)
-
-        if mark_new_as_seen and displayed_new_uids:
-            await deps.repo.mark_offers_seen(user_id, displayed_new_uids)
-
-        updated_stats = await deps.repo.get_user_stats(user_id)
-        await target_msg.answer(
-            f"Navigation ({title}):",
-            reply_markup=build_pagination_keyboard(
+        deps.set_digest_context(
+            display_msg.chat.id,
+            display_msg.message_id,
+            DigestMessageContext(
                 query=active_query,
-                total_pages=total_pages,
-                seen_count=updated_stats.seen_count,
-                profile_threshold=profile.min_score_threshold,
+                ordered_uids=[item.offer.uid for item in prepared.ranked],
+                page_size=page_size,
             ),
         )
+
+        text = format_digest_list(
+            title=prepared.title,
+            items=slice_items,
+            total_count=len(prepared.ranked),
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages,
+            query=active_query,
+            engine=prepared.engine,
+            model_id=prepared.model_id,
+            filtered_out_pre=prepared.filtered_out_pre,
+            active_threshold=prepared.active_threshold,
+            hidden_below_threshold=prepared.hidden_below_threshold,
+        )
+        kb = build_digest_list_keyboard(
+            query=active_query,
+            page_items=slice_items,
+            page_size=page_size,
+            total_pages=total_pages,
+            seen_count=prepared.stats.seen_count,
+            profile_threshold=prepared.profile.min_score_threshold,
+        )
+        await _safe_edit_text(display_msg, text, reply_markup=kb)
+
+    async def _render_offer_card_in_place(
+        target_msg: Message,
+        user_id: int,
+        offer_uid: str,
+        *,
+        ctx: DigestMessageContext | None = None,
+        index: int | None = None,
+        mark_seen: bool = True,
+    ) -> bool:
+        """Edit `target_msg` in-place to display a single offer card with contextual navigation."""
+        item = await deps.repo.get_enriched_offer(user_id, offer_uid)
+        if item is None:
+            return False
+
+        if mark_seen and item.status == OfferStatus.NEW:
+            await deps.repo.mark_offers_seen(user_id, [offer_uid])
+            item.status = OfferStatus.SEEN
+
+        resolved_idx = index
+        total = 0
+        back_query: DigestQuery | None = None
+        if ctx is not None:
+            total = len(ctx.ordered_uids)
+            if resolved_idx is None:
+                try:
+                    resolved_idx = ctx.ordered_uids.index(offer_uid)
+                except ValueError:
+                    resolved_idx = None
+            if resolved_idx is not None and ctx.page_size > 0:
+                back_query = replace(ctx.query, page=resolved_idx // ctx.page_size)
+            else:
+                back_query = ctx.query
+
+        pos_label = (
+            f"{resolved_idx + 1}/{total}"
+            if (resolved_idx is not None and total > 0)
+            else ""
+        )
+        await _safe_edit_text(
+            target_msg,
+            format_offer_card(item, position_label=pos_label),
+            reply_markup=build_offer_keyboard(
+                item,
+                index=resolved_idx,
+                total=total,
+                back_query=back_query,
+            ),
+        )
+        return True
+
+    async def _apply_offer_action(
+        user_id: int, action: str, offer_uid: str
+    ) -> tuple[EnrichedOffer | None, str]:
+        if action == "s":
+            updated = await deps.repo.toggle_star(user_id, offer_uid)
+            toast = "⭐ Starred" if (updated and updated.is_starred) else "☆ Unstarred"
+            return updated, toast
+        if action == "a":
+            updated = await deps.repo.set_offer_status(user_id, offer_uid, OfferStatus.APPLIED)
+            return updated, "✅ Marked as Applied"
+        if action == "x":
+            updated = await deps.repo.set_offer_status(user_id, offer_uid, OfferStatus.EXCLUDED)
+            return updated, "🚫 Excluded"
+        if action == "r":
+            updated = await deps.repo.set_offer_status(user_id, offer_uid, OfferStatus.SEEN)
+            return updated, "↩️ Restored to Seen"
+        return None, "Invalid action"
 
     # ------------------------------------------------------------------
     # Basic Commands: /start, /help, /status, /logs
@@ -827,7 +1010,7 @@ def build_router(deps: BotDependencies) -> Router:
                 recency_basis=parsed.recency_basis,
                 force_local=parsed.force_local,
             ),
-            mark_new_as_seen=True,
+            edit_in_place=False,
         )
 
     @router.message(Command("browse", "starred", "seen", "applied", "excluded"))
@@ -862,7 +1045,7 @@ def build_router(deps: BotDependencies) -> Router:
                 recency_basis=parsed.recency_basis,
                 force_local=parsed.force_local,
             ),
-            mark_new_as_seen=(view in {"new", "all"}),
+            edit_in_place=False,
         )
 
     # ------------------------------------------------------------------
@@ -1030,21 +1213,177 @@ def build_router(deps: BotDependencies) -> Router:
 
     @router.callback_query(F.data.startswith("pg:"))
     async def cb_paginate(callback: CallbackQuery) -> None:
-        if callback.from_user is None or callback.message is None or not callback.data:
+        if callback.from_user is None or not isinstance(callback.message, Message) or not callback.data:
             return
         _, query, _ = decode_query_callback(callback.data)
         await callback.answer()
-        if isinstance(callback.message, Message):
-            await render_view_page(
-                callback.message,
-                callback.from_user.id,
-                query,
-                mark_new_as_seen=(query.view in {"new", "all"}),
+        await render_view_page(
+            callback.message,
+            callback.from_user.id,
+            query,
+            edit_in_place=True,
+        )
+
+    @router.callback_query(F.data.startswith("ms:"))
+    async def cb_mark_page_seen(callback: CallbackQuery) -> None:
+        if callback.from_user is None or not isinstance(callback.message, Message) or not callback.data:
+            return
+        _, query, _ = decode_query_callback(callback.data)
+        uid = callback.from_user.id
+        msg = callback.message
+        ctx = deps.get_digest_context(msg.chat.id, msg.message_id)
+        page_size = ctx.page_size if ctx is not None else deps.settings.digest_page_size
+
+        if ctx is not None and ctx.query == query:
+            page_uids = ctx.ordered_uids[query.page * page_size : (query.page + 1) * page_size]
+        else:
+            prepared = await _prepare_digest_data(uid, query)
+            page_uids = [
+                item.offer.uid
+                for item in prepared.ranked[query.page * page_size : (query.page + 1) * page_size]
+            ]
+
+        marked = await deps.repo.mark_offers_seen(uid, page_uids)
+        await callback.answer(
+            f"👀 Marked {marked} offer(s) as seen" if marked else "Page already seen"
+        )
+        await render_view_page(msg, uid, query, edit_in_place=True)
+
+    @router.callback_query(F.data.startswith(("vw:", "oc:")))
+    async def cb_open_card(callback: CallbackQuery) -> None:
+        if callback.from_user is None or not isinstance(callback.message, Message) or not callback.data:
+            return
+        _, query, raw_idx = decode_query_callback(callback.data)
+        try:
+            idx = max(0, int(raw_idx))
+        except ValueError as exc:
+            raise ValidationError("Invalid offer index. Please refresh with /digest.") from exc
+
+        uid = callback.from_user.id
+        msg = callback.message
+        ctx = deps.get_digest_context(msg.chat.id, msg.message_id)
+        if ctx is None or idx >= len(ctx.ordered_uids):
+            # Stateless restart-safe fallback: rebuild context from the encoded DigestQuery.
+            prepared = await _prepare_digest_data(uid, query)
+            if not prepared.ranked:
+                await callback.answer("No offers remain in this view.", show_alert=False)
+                await render_view_page(msg, uid, query, edit_in_place=True)
+                return
+            ctx = DigestMessageContext(
+                query=query,
+                ordered_uids=[item.offer.uid for item in prepared.ranked],
+                page_size=deps.settings.digest_page_size,
             )
+            deps.set_digest_context(msg.chat.id, msg.message_id, ctx)
+
+        clamped_idx = max(0, min(idx, len(ctx.ordered_uids) - 1))
+        offer_uid = ctx.ordered_uids[clamped_idx]
+        await callback.answer()
+        rendered = await _render_offer_card_in_place(
+            msg,
+            uid,
+            offer_uid,
+            ctx=ctx,
+            index=clamped_idx,
+            mark_seen=True,
+        )
+        if not rendered:
+            await render_view_page(msg, uid, query, edit_in_place=True)
+
+    @router.callback_query(F.data.startswith("od:"))
+    async def cb_offer_description(callback: CallbackQuery) -> None:
+        if callback.from_user is None or not isinstance(callback.message, Message) or not callback.data:
+            return
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await callback.answer("Invalid description request", show_alert=False)
+            return
+        _, raw_part, offer_uid = parts
+        try:
+            part = max(0, int(raw_part))
+        except ValueError:
+            part = 0
+
+        uid = callback.from_user.id
+        msg = callback.message
+        item = await deps.repo.get_enriched_offer(uid, offer_uid)
+        if item is None:
+            await callback.answer("Offer not found.", show_alert=True)
+            return
+
+        await callback.answer()
+        ctx = deps.get_digest_context(msg.chat.id, msg.message_id)
+        back_query = ctx.query if ctx is not None else None
+        text, clamped, total_parts = format_offer_description_page(item, part=part)
+        await _safe_edit_text(
+            msg,
+            text,
+            reply_markup=build_description_keyboard(
+                item,
+                part=clamped,
+                total_parts=total_parts,
+                back_query=back_query,
+            ),
+        )
+
+    @router.callback_query(F.data.startswith("ob:"))
+    async def cb_back_to_card(callback: CallbackQuery) -> None:
+        if callback.from_user is None or not isinstance(callback.message, Message) or not callback.data:
+            return
+        offer_uid = callback.data.split(":", 1)[1]
+        uid = callback.from_user.id
+        msg = callback.message
+        ctx = deps.get_digest_context(msg.chat.id, msg.message_id)
+        await callback.answer()
+        rendered = await _render_offer_card_in_place(
+            msg,
+            uid,
+            offer_uid,
+            ctx=ctx,
+            mark_seen=False,
+        )
+        if not rendered:
+            await callback.answer("Offer not found.", show_alert=True)
+
+    @router.callback_query(F.data.startswith("of:"))
+    async def cb_offer_action_in_description(callback: CallbackQuery) -> None:
+        if callback.from_user is None or not isinstance(callback.message, Message) or not callback.data:
+            return
+        parts = callback.data.split(":", 3)
+        if len(parts) != 4:
+            await callback.answer("Invalid action", show_alert=False)
+            return
+        _, action, raw_part, offer_uid = parts
+        try:
+            part = max(0, int(raw_part))
+        except ValueError:
+            part = 0
+
+        uid = callback.from_user.id
+        msg = callback.message
+        updated, toast = await _apply_offer_action(uid, action, offer_uid)
+        if updated is None:
+            await callback.answer("Offer not found in database.", show_alert=True)
+            return
+
+        await callback.answer(toast)
+        ctx = deps.get_digest_context(msg.chat.id, msg.message_id)
+        back_query = ctx.query if ctx is not None else None
+        text, clamped, total_parts = format_offer_description_page(updated, part=part)
+        await _safe_edit_text(
+            msg,
+            text,
+            reply_markup=build_description_keyboard(
+                updated,
+                part=clamped,
+                total_parts=total_parts,
+                back_query=back_query,
+            ),
+        )
 
     @router.callback_query(F.data.startswith("o:"))
     async def cb_offer_action(callback: CallbackQuery) -> None:
-        if callback.from_user is None or callback.message is None or not callback.data:
+        if callback.from_user is None or not isinstance(callback.message, Message) or not callback.data:
             return
         parts = callback.data.split(":", 2)
         if len(parts) != 3:
@@ -1052,46 +1391,43 @@ def build_router(deps: BotDependencies) -> Router:
             return
         _, action, offer_uid = parts
         uid = callback.from_user.id
+        msg = callback.message
+        ctx = deps.get_digest_context(msg.chat.id, msg.message_id)
 
+        # Backwards compatibility for older cards with `o:d:<uid>`
         if action == "d":
             item = await deps.repo.get_enriched_offer(uid, offer_uid)
             if item is None:
                 await callback.answer("Offer not found.", show_alert=True)
                 return
             await callback.answer()
-            o = item.offer
-            header = f"📄 <b>{esc(o.title)}</b> — {esc(o.company)} (#{esc(o.external_id)})\n\n"
-            body = esc(o.description) if o.description else "<i>No description embedded in saved .htm file.</i>"
-            if isinstance(callback.message, Message):
-                for idx, chunk in enumerate(chunk_text(header + body)):
-                    await callback.message.answer(chunk if idx == 0 else chunk)
+            back_query = ctx.query if ctx is not None else None
+            text, clamped, total_parts = format_offer_description_page(item, part=0)
+            await _safe_edit_text(
+                msg,
+                text,
+                reply_markup=build_description_keyboard(
+                    item,
+                    part=clamped,
+                    total_parts=total_parts,
+                    back_query=back_query,
+                ),
+            )
             return
 
-        updated: EnrichedOffer | None = None
-        toast = ""
-        if action == "s":
-            updated = await deps.repo.toggle_star(uid, offer_uid)
-            toast = "⭐ Starred" if (updated and updated.is_starred) else "☆ Unstarred"
-        elif action == "a":
-            updated = await deps.repo.set_offer_status(uid, offer_uid, OfferStatus.APPLIED)
-            toast = "✅ Marked as Applied"
-        elif action == "x":
-            updated = await deps.repo.set_offer_status(uid, offer_uid, OfferStatus.EXCLUDED)
-            toast = "🚫 Excluded"
-        elif action == "r":
-            updated = await deps.repo.set_offer_status(uid, offer_uid, OfferStatus.SEEN)
-            toast = "↩️ Restored to Seen"
-
+        updated, toast = await _apply_offer_action(uid, action, offer_uid)
         if updated is None:
             await callback.answer("Offer not found in database.", show_alert=True)
             return
 
         await callback.answer(toast)
-        if isinstance(callback.message, Message):
-            await callback.message.edit_text(
-                format_offer_card(updated),
-                reply_markup=build_offer_keyboard(updated),
-            )
+        await _render_offer_card_in_place(
+            msg,
+            uid,
+            offer_uid,
+            ctx=ctx,
+            mark_seen=False,
+        )
 
     # ------------------------------------------------------------------
     # Centralized Global Error Handler (Structured Trace + Safe User Reply)

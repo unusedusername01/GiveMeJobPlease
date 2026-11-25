@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from give_me_job_please.core.diff import RecencyBasis
+from give_me_job_please.core.diff import RecencyBasis, format_offer_age
 from give_me_job_please.core.models import EnrichedOffer, OfferStatus, UserProfile
 from give_me_job_please.errors import ValidationError
 
@@ -120,7 +120,84 @@ def esc(text: str) -> str:
     return html.escape(text or "", quote=False)
 
 
-def format_offer_card(item: EnrichedOffer) -> str:
+def _truncate(text: str, max_len: int) -> str:
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max(1, max_len - 1)].rstrip() + "…"
+
+
+def format_digest_list(
+    *,
+    title: str,
+    items: list[EnrichedOffer],
+    total_count: int,
+    page: int,
+    page_size: int,
+    total_pages: int,
+    query: DigestQuery,
+    engine: str,
+    model_id: str,
+    filtered_out_pre: int = 0,
+    active_threshold: float | None = None,
+    hidden_below_threshold: int = 0,
+) -> str:
+    """Render a compact, single-message ranked list of offers for in-place Telegram browsing."""
+    start_num = page * page_size + 1
+    end_num = start_num + len(items) - 1
+    engine_badge = (
+        f"🤖 <code>{esc(model_id)}</code>"
+        if engine == "openrouter"
+        else f"🧠 <code>{esc(model_id)}</code>"
+    )
+
+    meta_parts: list[str] = [engine_badge]
+    if query.max_age_days is not None:
+        rec = format_recency_label(query.max_age_days, query.recency_basis)
+        if filtered_out_pre > 0:
+            rec += f" · {filtered_out_pre} skipped"
+        meta_parts.append(f"📅 {esc(rec)}")
+    if active_threshold is not None:
+        t_txt = f"🎯 ≥{active_threshold:g}"
+        if hidden_below_threshold > 0:
+            t_txt += f" ({hidden_below_threshold} hidden)"
+        meta_parts.append(t_txt)
+
+    lines = [
+        f"<b>{title}</b> — <b>{start_num}–{end_num}</b> of <b>{total_count}</b> "
+        f"(Page {page + 1}/{total_pages})",
+        " · ".join(meta_parts),
+        "",
+    ]
+
+    for idx, item in enumerate(items, start=1):
+        o = item.offer
+        badge = _STATUS_BADGE.get(item.status, "")
+        star = "⭐" if item.is_starred else ""
+        score_txt = f"<b>{item.score:.1f}</b>" if item.score is not None else "<i>—</i>"
+        loc = _truncate(o.assignment_location or o.company_hq or "Unspecified", 24)
+        loc_flag = " ✓" if item.location_match is True else (" ⚠️" if item.location_match is False else "")
+        age = format_offer_age(item, basis=query.recency_basis)
+        age_part = f" · {esc(age)}" if age else ""
+        comp_part = ""
+        if o.registered is not None and o.places is not None:
+            comp_part = f" · 👥 {o.registered}/{o.places}"
+
+        lines.append(
+            f"<b>{idx}.</b> {badge}{star} [{score_txt}] <b>{esc(_truncate(o.title, 58))}</b>\n"
+            f"    {esc(_truncate(o.company, 28))} · {esc(loc)}{loc_flag}{age_part}{comp_part}"
+        )
+
+    lines.append("")
+    lines.append("<i>Tap a number below to inspect an offer in-place.</i>")
+    return "\n".join(lines)
+
+
+def format_offer_card(
+    item: EnrichedOffer,
+    *,
+    position_label: str = "",
+) -> str:
     """Format a single internship offer as a compact, scannable Telegram HTML card."""
     o = item.offer
     badge = _STATUS_BADGE.get(item.status, "")
@@ -144,8 +221,9 @@ def format_offer_card(item: EnrichedOffer) -> str:
         ratio_txt = f" ({ratio:.1f}x)" if ratio is not None else ""
         comp = f" | 👥 {o.registered}/{o.places}{ratio_txt}"
 
+    pos_prefix = f"<code>[{esc(position_label)}]</code> " if position_label else ""
     lines = [
-        f"{badge} {star}<b>{esc(o.title)}</b>",
+        f"{pos_prefix}{badge} {star}<b>{esc(o.title)}</b>",
         f"🏢 {esc(o.company)} · 📍 {esc(location_line)}{loc_flag}",
         f"🎯 {score_txt} · 🏷 {esc(o.format or 'N/A')} · #{esc(o.external_id)}{comp}",
     ]
@@ -164,14 +242,20 @@ def format_offer_card(item: EnrichedOffer) -> str:
     return "\n".join(lines)
 
 
-def build_offer_keyboard(item: EnrichedOffer) -> InlineKeyboardMarkup:
+def build_offer_keyboard(
+    item: EnrichedOffer,
+    *,
+    index: int | None = None,
+    total: int = 0,
+    back_query: DigestQuery | None = None,
+) -> InlineKeyboardMarkup:
     """Build per-offer inline action buttons (all callback_data strictly < 64 bytes)."""
     uid = item.offer.uid
     star_label = "★ Unstar" if item.is_starred else "☆ Star"
 
     row1 = [
         InlineKeyboardButton(text=star_label, callback_data=f"o:s:{uid}"),
-        InlineKeyboardButton(text="📄 Details", callback_data=f"o:d:{uid}"),
+        InlineKeyboardButton(text="📄 Full Description", callback_data=f"od:0:{uid}"),
     ]
 
     if item.status in {OfferStatus.EXCLUDED, OfferStatus.APPLIED}:
@@ -186,7 +270,183 @@ def build_offer_keyboard(item: EnrichedOffer) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="❌ Exclude", callback_data=f"o:x:{uid}"),
         ]
 
-    return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
+    rows: list[list[InlineKeyboardButton]] = [row1, row2]
+
+    if back_query is not None and index is not None and total > 1:
+        nav_row: list[InlineKeyboardButton] = []
+        if index > 0:
+            nav_row.append(
+                InlineKeyboardButton(
+                    text="◀️ Prev",
+                    callback_data=encode_query_callback("oc", back_query, extra=str(index - 1)),
+                )
+            )
+        nav_row.append(InlineKeyboardButton(text=f"{index + 1}/{total}", callback_data="noop"))
+        if index + 1 < total:
+            nav_row.append(
+                InlineKeyboardButton(
+                    text="Next ▶️",
+                    callback_data=encode_query_callback("oc", back_query, extra=str(index + 1)),
+                )
+            )
+        rows.append(nav_row)
+
+    if back_query is not None:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="◀️ Back to list",
+                    callback_data=encode_query_callback("pg", back_query),
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_digest_list_keyboard(
+    *,
+    query: DigestQuery,
+    page_items: list[EnrichedOffer],
+    page_size: int,
+    total_pages: int,
+    seen_count: int = 0,
+    profile_threshold: float | None = None,
+) -> InlineKeyboardMarkup:
+    """Build single-message list keyboard: numbered item selectors, pagination, mark-seen, filters."""
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # Numbered drill-down buttons (max 5 per row for comfortable mobile tapping)
+    base_idx = query.page * page_size
+    num_buttons = [
+        InlineKeyboardButton(
+            text=str(offset + 1),
+            callback_data=encode_query_callback("vw", query, extra=str(base_idx + offset)),
+        )
+        for offset in range(len(page_items))
+    ]
+    for i in range(0, len(num_buttons), 5):
+        rows.append(num_buttons[i : i + 5])
+
+    if total_pages > 0:
+        nav: list[InlineKeyboardButton] = []
+        if query.page > 0:
+            nav.append(
+                InlineKeyboardButton(
+                    text="◀️ Prev",
+                    callback_data=encode_query_callback("pg", replace(query, page=query.page - 1)),
+                )
+            )
+        nav.append(
+            InlineKeyboardButton(text=f"Page {query.page + 1}/{total_pages}", callback_data="noop")
+        )
+        if query.page + 1 < total_pages:
+            nav.append(
+                InlineKeyboardButton(
+                    text="Next ▶️",
+                    callback_data=encode_query_callback("pg", replace(query, page=query.page + 1)),
+                )
+            )
+        rows.append(nav)
+
+    new_on_page = sum(1 for item in page_items if item.status == OfferStatus.NEW)
+    if new_on_page > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"👀 Mark page seen ({new_on_page})",
+                    callback_data=encode_query_callback("ms", query),
+                )
+            ]
+        )
+
+    rows.extend(
+        build_filter_rows(
+            query=query,
+            seen_count=seen_count,
+            profile_threshold=profile_threshold,
+        )
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_offer_description_page(
+    item: EnrichedOffer,
+    *,
+    part: int = 0,
+    max_chunk_len: int = 3300,
+) -> tuple[str, int, int]:
+    """
+    Format an in-place full-description view for an offer.
+
+    Returns (html_text, clamped_part_index, total_parts).
+    """
+    o = item.offer
+    badge = _STATUS_BADGE.get(item.status, "")
+    star = "⭐ " if item.is_starred else ""
+    body_raw = o.description.strip()
+    chunks = chunk_text(body_raw, max_len=max_chunk_len) if body_raw else []
+
+    total_parts = max(1, len(chunks))
+    clamped = max(0, min(part, total_parts - 1))
+    part_suffix = f" · Part {clamped + 1}/{total_parts}" if total_parts > 1 else ""
+    header = (
+        f"📄 {badge} {star}<b>{esc(o.title)}</b> — {esc(o.company)} "
+        f"(#{esc(o.external_id)}{part_suffix})\n\n"
+    )
+    body_html = (
+        esc(chunks[clamped])
+        if chunks
+        else "<i>No description embedded in saved .htm file (check IS-Academia portal).</i>"
+    )
+    return header + body_html, clamped, total_parts
+
+
+def build_description_keyboard(
+    item: EnrichedOffer,
+    *,
+    part: int,
+    total_parts: int,
+    back_query: DigestQuery | None = None,
+) -> InlineKeyboardMarkup:
+    """Build inline controls for in-place description view (chunk paging + direct offer actions)."""
+    uid = item.offer.uid
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if total_parts > 1:
+        pager: list[InlineKeyboardButton] = []
+        if part > 0:
+            pager.append(
+                InlineKeyboardButton(text="◀️ Prev part", callback_data=f"od:{part - 1}:{uid}")
+            )
+        pager.append(InlineKeyboardButton(text=f"Part {part + 1}/{total_parts}", callback_data="noop"))
+        if part + 1 < total_parts:
+            pager.append(
+                InlineKeyboardButton(text="Next part ▶️", callback_data=f"od:{part + 1}:{uid}")
+            )
+        rows.append(pager)
+
+    star_label = "★ Unstar" if item.is_starred else "☆ Star"
+    actions = [InlineKeyboardButton(text=star_label, callback_data=f"of:s:{part}:{uid}")]
+    if item.status in {OfferStatus.EXCLUDED, OfferStatus.APPLIED}:
+        actions.append(InlineKeyboardButton(text="↩️ Restore", callback_data=f"of:r:{part}:{uid}"))
+        if item.status != OfferStatus.APPLIED:
+            actions.append(InlineKeyboardButton(text="✅ Applied", callback_data=f"of:a:{part}:{uid}"))
+    else:
+        actions.append(InlineKeyboardButton(text="✅ Applied", callback_data=f"of:a:{part}:{uid}"))
+        actions.append(InlineKeyboardButton(text="❌ Exclude", callback_data=f"of:x:{part}:{uid}"))
+    rows.append(actions)
+
+    back_row = [InlineKeyboardButton(text="◀️ Back to card", callback_data=f"ob:{uid}")]
+    if back_query is not None:
+        back_row.append(
+            InlineKeyboardButton(
+                text="📋 Back to list",
+                callback_data=encode_query_callback("pg", back_query),
+            )
+        )
+    rows.append(back_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_filter_rows(
