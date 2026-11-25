@@ -1,0 +1,26 @@
+# Secrets and runtime data must never be sent to the Docker builder.
+# The Dockerfile copies only what it needs, but the build context is the whole
+# working tree, so keep .env and data/ out of it explicitly.
+.env
+.env.*
+data/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# VCS and local tooling
+.git/
+.github/
+.venv/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Not needed to build the image
+tests/

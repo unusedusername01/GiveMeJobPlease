@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import math
 from pathlib import Path
@@ -31,7 +32,7 @@ from give_me_job_please.core.auth.openrouter_pkce import (
 )
 from give_me_job_please.core.diff import sort_by_relevance
 from give_me_job_please.core.exporter import export_csv_bytes, export_descriptions_json_bytes
-from give_me_job_please.core.models import EnrichedOffer, OfferStatus
+from give_me_job_please.core.models import EnrichedOffer, OfferScore, OfferStatus
 from give_me_job_please.core.parsers.cv_parser import parse_cv_bytes
 from give_me_job_please.core.parsers.isacademia import (
     REGISTRATIONS_PARSER_VERSION,
@@ -82,6 +83,8 @@ class BotDependencies:
         self.pkce = pkce_manager
         self.local_scorer = local_scorer
         self.error_log_path = error_log_path
+        # One lock per user: prevents duplicate concurrent scoring runs (and billing).
+        self.scoring_locks: dict[int, asyncio.Lock] = {}
 
 
 def build_router(deps: BotDependencies) -> Router:
@@ -93,6 +96,25 @@ def build_router(deps: BotDependencies) -> Router:
     # ------------------------------------------------------------------
 
     async def ensure_scored(
+        user_id: int,
+        items: list[EnrichedOffer],
+        *,
+        force_local: bool = False,
+        status_msg: Message | None = None,
+    ) -> tuple[list[EnrichedOffer], str, str]:
+        """Serialise scoring per user so double taps cannot run duplicate paid passes."""
+        lock = deps.scoring_locks.setdefault(user_id, asyncio.Lock())
+        if lock.locked():
+            raise ValidationError(
+                "A scoring run is already in progress for your account. "
+                "Please wait for it to finish before retrying."
+            )
+        async with lock:
+            return await _ensure_scored_unlocked(
+                user_id, items, force_local=force_local, status_msg=status_msg
+            )
+
+    async def _ensure_scored_unlocked(
         user_id: int,
         items: list[EnrichedOffer],
         *,
@@ -147,7 +169,15 @@ def build_router(deps: BotDependencies) -> Router:
                     app_title=deps.settings.openrouter_app_title,
                     app_url=deps.settings.openrouter_app_url,
                 )
-                new_scores = await scorer.score_offers(profile, to_score, fingerprint)
+
+                async def _checkpoint(batch_scores: list[OfferScore]) -> None:
+                    # Persist each completed batch immediately: a later batch failure
+                    # must not discard (and re-bill) batches that already succeeded.
+                    await deps.repo.save_scores(user_id, batch_scores)
+
+                new_scores = await scorer.score_offers(
+                    profile, to_score, fingerprint, on_batch_complete=_checkpoint
+                )
             else:
                 prof_vec, offer_vecs = await deps.repo.load_embedding_cache(
                     user_id, [o.uid for o in to_score], deps.local_scorer.model_id
@@ -297,6 +327,8 @@ def build_router(deps: BotDependencies) -> Router:
             f"👋 <b>GiveMeJobPlease v{esc(__version__)}</b>\n\n"
             "<b>Quick workflow:</b>\n"
             "1. Set your preferences via /profile and optionally attach your CV via /cv (or drop a PDF/TXT).\n"
+            "   ⚠️ Upload an ANONYMISED CV only: replace name, email, phone and street address "
+            "with mock data (e.g. John Doe, john.doe@example.com, Vaud). See the README.\n"
             "2. Optional: Connect OpenRouter via /connect_openrouter (overrides local embeddings).\n"
             "3. Save IS-Academia <code>Internships showroom (stu).htm</code> (or <code>Registrations (stu).htm</code>) "
             "and drop the file right into this chat.\n"
@@ -503,7 +535,11 @@ def build_router(deps: BotDependencies) -> Router:
         else:
             await message.answer(
                 "📄 No CV uploaded yet.\n"
-                "Simply attach and send your CV as a <code>.pdf</code>, <code>.txt</code>, or <code>.md</code> file right in this chat."
+                "Simply attach and send your CV as a <code>.pdf</code>, <code>.txt</code>, or <code>.md</code> file right in this chat.\n\n"
+                "⚠️ <b>Upload an anonymised CV only.</b> Replace your name, email, phone, and street "
+                "address with mock data (e.g. <code>John Doe</code>, <code>john.doe@example.com</code>, "
+                "region only like <code>Vaud</code>). The text is encrypted at rest and, while OpenRouter "
+                "is connected, sent to the selected model provider. See the README for details."
             )
 
     # ------------------------------------------------------------------
@@ -528,7 +564,7 @@ def build_router(deps: BotDependencies) -> Router:
 
         # 1. CV upload (.pdf, .txt, .md)
         if lower.endswith((".pdf", ".txt", ".md")):
-            cv_text = parse_cv_bytes(raw_bytes, filename)
+            cv_text = await asyncio.to_thread(parse_cv_bytes, raw_bytes, filename)
             profile = await deps.repo.get_or_create_profile(user_id)
             profile.cv_text = cv_text
             profile.cv_filename = filename
@@ -542,9 +578,9 @@ def build_router(deps: BotDependencies) -> Router:
 
         # 2. IS-Academia HTML upload (.htm, .html)
         if lower.endswith((".htm", ".html")):
-            file_type = detect_isacademia_file_type(raw_bytes)
+            file_type = await asyncio.to_thread(detect_isacademia_file_type, raw_bytes)
             if file_type == "showroom":
-                offers = parse_showroom_html(raw_bytes)
+                offers = await asyncio.to_thread(parse_showroom_html, raw_bytes)
                 summary = await deps.repo.ingest_showroom_offers(
                     user_id=user_id,
                     offers=offers,
@@ -562,7 +598,7 @@ def build_router(deps: BotDependencies) -> Router:
                 )
                 return
 
-            records = parse_registrations_html(raw_bytes)
+            records = await asyncio.to_thread(parse_registrations_html, raw_bytes)
             summary = await deps.repo.ingest_registrations(
                 user_id=user_id,
                 records=records,
@@ -720,8 +756,8 @@ def build_router(deps: BotDependencies) -> Router:
             found = await verify_openrouter_model_exists(arg)
             if found is None:
                 raise ValidationError(
-                    f"Model <code>{esc(arg)}</code> was not found in OpenRouter's catalog. "
-                    "Search first with e.g. <code>/model deepseek</code>."
+                    f"Model '{arg}' was not found in OpenRouter's catalog. "
+                    "Search first with e.g. /model deepseek."
                 )
             await deps.repo.set_openrouter_model(uid, found.id)
             p_in = f"${found.prompt_price_per_m:.3f}/M" if found.prompt_price_per_m is not None else "n/a"
@@ -789,12 +825,16 @@ def build_router(deps: BotDependencies) -> Router:
             return
         _, view, raw_page = callback.data.split(":", 2)
         await callback.answer()
+        try:
+            page = max(0, int(raw_page))
+        except ValueError as exc:
+            raise ValidationError("Invalid pagination data. Please run the command again.") from exc
         if isinstance(callback.message, Message):
             await render_view_page(
                 callback.message,
                 callback.from_user.id,
                 view=view,
-                page=int(raw_page),
+                page=page,
                 mark_new_as_seen=(view in {"new", "all"}),
             )
 

@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import sys
+from contextlib import suppress
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,14 @@ import structlog
 _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"sk-or-v1-[A-Za-z0-9_-]{12,}"), "[REDACTED_OPENROUTER_KEY]"),
     (re.compile(r"sk-or-[A-Za-z0-9_-]{12,}"), "[REDACTED_OPENROUTER_KEY]"),
-    (re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b"), "[REDACTED_TELEGRAM_TOKEN]"),
+    # No leading \b: Bot API URLs embed the token as ".../file/bot123456789:AA...",
+    # and a word boundary would not match after "bot".
+    (re.compile(r"(?<!\d)\d{8,12}:[A-Za-z0-9_-]{30,}"), "[REDACTED_TELEGRAM_TOKEN]"),
+    # urlsafe-base64 32-byte key, i.e. the ENCRYPTION_KEY value itself
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{43}=(?![A-Za-z0-9_-])"),
+        "[REDACTED_ENCRYPTION_KEY]",
+    ),
     (re.compile(r"(Bearer\s+)[A-Za-z0-9._-]{12,}", re.IGNORECASE), r"\1[REDACTED]"),
 ]
 
@@ -54,6 +62,8 @@ def _redact_recursive(obj: Any) -> Any:
         return cleaned
     if isinstance(obj, list):
         return [_redact_recursive(item) for item in obj]
+    if isinstance(obj, tuple):
+        return tuple(_redact_recursive(item) for item in obj)
     return obj
 
 
@@ -95,6 +105,9 @@ def configure_logging(log_dir: Path, log_level: str = "INFO") -> Path:
     )
     error_file_handler.setLevel(logging.ERROR)
     error_file_handler.setFormatter(formatter)
+    # Error logs can contain trace fragments: keep them owner-only (0600).
+    with suppress(OSError):  # platform/filesystem dependent
+        error_log_path.chmod(0o600)
 
     root_logger = logging.getLogger()
     root_logger.handlers.clear()

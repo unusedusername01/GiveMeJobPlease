@@ -5,7 +5,7 @@ Personal, self-hosted Telegram bot for parsing, tracking, and ranking **EPFL IS-
 ## Highlights
 - **Zero-Scraping, Drop-to-Bot Workflow:** Hit `Ctrl+S` on IS-Academia (`Internships showroom (stu).htm` or `Registrations (stu).htm`) and drop the file into your Telegram bot chat.
 - **Pipeline-Ready State Machine:** Tracks `new`, `seen`, `applied`, and `excluded` offers plus an independent `⭐ Star` flag. Eligible pool is always `Current Showroom - Applied - Excluded`, with one-tap toggles to revisit `seen`, `starred`, `applied`, or `excluded` offers.
-- **Profile + CV Context:** Guided `/profile` wizard plus `.pdf` / `.txt` / `.md` CV extraction.
+- **Profile + CV Context:** Guided `/profile` wizard plus `.pdf` / `.txt` / `.md` CV extraction. **Upload an anonymised CV only** — see [Data Handling & CV Privacy Policy](#data-handling--cv-privacy-policy).
 - **Dual Scoring Engine:**
   - **Mode B (Primary when connected):** Connect OpenRouter via secure headless **OAuth PKCE** (`/connect_openrouter` → `/auth <code>`) to score offers with DeepSeek, Qwen, or any OpenRouter model. Completely overrides local embeddings.
   - **Mode A (Default without API key):** Runs local multilingual ONNX embeddings (`fastembed`) on CPU with zero API keys and displays all eligible matches ranked by cosine similarity.
@@ -23,6 +23,40 @@ Personal, self-hosted Telegram bot for parsing, tracking, and ranking **EPFL IS-
    docker compose up -d --build
    docker compose logs -f
    ```
+
+## Data Handling & CV Privacy Policy
+
+**Do not upload your real CV.** Replace every identifying or sensitive value with mock
+data before the file ever reaches the bot. Keep the substance (skills, technologies,
+projects, languages, years of experience) — that is what the scorer actually reads.
+
+| Field | Replace with |
+| --- | --- |
+| Full name | `John Doe` |
+| Email | `john.doe@example.com` |
+| Phone | `+41 00 000 00 00` |
+| Street address | Region only, e.g. `Vaud`, `Zurich`, `Haute-Savoie` |
+| Date of birth / nationality / marital status | Remove |
+| Personal URLs, social handles | `example.com` |
+| Employers / schools (optional) | Generic equivalents, e.g. `EPFL` → `Example University` |
+
+The same rule applies to `/profile` free-text fields: they are copied verbatim into LLM
+prompts and stored unencrypted, so keep them free of personal data.
+
+### Where the CV actually goes
+
+| Destination | What it sees | When |
+| --- | --- | --- |
+| Telegram servers | The uploaded file itself. Bot chats are **cloud chats, not end-to-end encrypted**, and anyone holding the bot token can download the file | Always |
+| Local SQLite (`user_config.cv_text`) | Up to 20,000 chars of extracted text, stored as AES-256-GCM ciphertext (`enc:v1:` prefix, bound to your user id) | Always |
+| Local SQLite backups (`data/backups/`) | Copies of the DB. Rows written before this encryption landed — and any backup taken before it — may still hold **plaintext** CV text until re-upload + expiry of old backups | Always |
+| Local ONNX embedder (Mode A) | Nothing leaves the host | Default |
+| OpenRouter + the selected upstream model provider (Mode B) | The first ~5,000 chars of CV text inside the scoring prompt, wrapped as untrusted data | Only while OpenRouter is connected |
+
+Only the OpenRouter key and the CV text are encrypted; everything else in `./data` is
+protected solely by filesystem permissions (`errors.jsonl` and DB backups are created
+`0600`). Use `/digest local` to force offline scoring for a run, and
+`/disconnect_openrouter` to wipe the stored key and return to Mode A permanently.
 
 ## Local Development (`uv`)
 
@@ -44,7 +78,7 @@ uv run mypy src
 ## Telegram Commands
 - `/start` — Verify access & show quick help
 - `/profile` — Guided preference setup (roles, locations, formats, dealbreakers)
-- `/cv` — Upload a `.pdf`, `.txt`, or `.md` CV (or drop it directly in chat)
+- `/cv` — Upload a `.pdf`, `.txt`, or `.md` CV (or drop it directly in chat) — **anonymised only**
 - `/digest` — Score & view `new` offers (`/digest local` forces offline Mode A)
 - `/browse [all|new|seen|starred|applied|excluded]` — Browse offers sorted by relevance
 - `/connect_openrouter [limit] [expiration]` — Start headless OAuth PKCE flow

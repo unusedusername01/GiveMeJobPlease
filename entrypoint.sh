@@ -21,6 +21,8 @@ if "sqlite" in db_url:
         backup_path = backup_dir / f"give_me_job_please_{stamp}.db"
         with sqlite3.connect(db_path) as src, sqlite3.connect(backup_path) as dst:
             src.backup(dst)
+        # Backups contain the (encrypted) key and CV ciphertext: owner-only.
+        os.chmod(backup_path, 0o600)
         # Keep only the 10 most recent backups
         backups = sorted(backup_dir.glob("give_me_job_please_*.db"))
         for old in backups[:-10]:

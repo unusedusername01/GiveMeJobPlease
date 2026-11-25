@@ -10,6 +10,7 @@ from pypdf import PdfReader
 from give_me_job_please.errors import ParseError
 
 MAX_CV_STORED_CHARS = 20_000
+MAX_CV_PAGES = 20
 
 
 def parse_cv_bytes(raw_bytes: bytes, filename: str) -> str:
@@ -18,8 +19,16 @@ def parse_cv_bytes(raw_bytes: bytes, filename: str) -> str:
     if lower_name.endswith(".pdf"):
         try:
             reader = PdfReader(io.BytesIO(raw_bytes))
+            if len(reader.pages) > MAX_CV_PAGES:
+                raise ParseError(
+                    f"This PDF has {len(reader.pages)} pages; the maximum supported is "
+                    f"{MAX_CV_PAGES}. Please upload a shorter CV.",
+                    detail=f"CV page count {len(reader.pages)} exceeds limit {MAX_CV_PAGES}",
+                )
             pages = [page.extract_text() or "" for page in reader.pages]
             raw_text = "\n\n".join(pages)
+        except ParseError:
+            raise
         except Exception as exc:
             raise ParseError(
                 "Could not read this PDF file. Please ensure it is not password-protected "

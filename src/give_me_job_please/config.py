@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     )
 
     telegram_bot_token: SecretStr
-    telegram_allowed_user_ids: Annotated[list[int], NoDecode]
+    telegram_allowed_user_ids: Annotated[list[int], NoDecode] = Field(min_length=1)
     encryption_key: SecretStr
 
     database_url: str = "sqlite+aiosqlite:///data/give_me_job_please.db"

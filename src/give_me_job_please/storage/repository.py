@@ -10,6 +10,7 @@ import numpy as np
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from give_me_job_please.core.auth.crypto import SecretBox
 from give_me_job_please.core.models import (
     EnrichedOffer,
     IngestSummary,
@@ -20,6 +21,7 @@ from give_me_job_please.core.models import (
     UserProfile,
 )
 from give_me_job_please.core.scoring.local_embedder import bytes_to_vector, vector_to_bytes
+from give_me_job_please.errors import AuthError
 from give_me_job_please.storage.orm import (
     IngestBatchORM,
     OfferORM,
@@ -31,6 +33,10 @@ from give_me_job_please.storage.orm import (
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# Marks a cv_text value as AES-256-GCM ciphertext rather than legacy plaintext.
+_ENC_PREFIX = "enc:v1:"
 
 
 @dataclass(slots=True)
@@ -55,8 +61,39 @@ class UserStats:
 class OfferRepository:
     """Data-access layer decoupling core domain models from SQLAlchemy ORM tables."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        secret_box: SecretBox | None = None,
+    ) -> None:
         self._sessions = session_factory
+        self._secret_box = secret_box
+
+    # ------------------------------------------------------------------
+    # CV encryption helpers (at-rest protection for resume text)
+    # ------------------------------------------------------------------
+
+    def _encrypt_cv(self, user_id: int, plaintext: str) -> str:
+        """Encrypt CV text for storage; legacy plaintext is left readable on read."""
+        if not plaintext or self._secret_box is None:
+            return plaintext
+        token = self._secret_box.encrypt(plaintext, associated_data=f"cv:{user_id}")
+        return f"{_ENC_PREFIX}{token}"
+
+    def _decrypt_cv(self, user_id: int, stored: str) -> str:
+        """Decrypt a stored CV value, transparently accepting pre-encryption rows."""
+        if not stored or not stored.startswith(_ENC_PREFIX):
+            return stored
+        if self._secret_box is None:
+            raise AuthError(
+                "Cannot decrypt the stored CV without the master encryption key. "
+                "Restart the bot with a valid ENCRYPTION_KEY.",
+                detail="SecretBox unavailable while reading encrypted cv_text.",
+            )
+        return self._secret_box.decrypt(
+            stored[len(_ENC_PREFIX) :], associated_data=f"cv:{user_id}"
+        )
 
     # ------------------------------------------------------------------
     # User Config / Profile / OpenRouter Credentials
@@ -90,7 +127,7 @@ class OfferRepository:
             row.preferred_locations = profile.preferred_locations
             row.accepted_formats_json = json.dumps(profile.accepted_formats, ensure_ascii=False)
             row.dealbreakers = profile.dealbreakers
-            row.cv_text = profile.cv_text
+            row.cv_text = self._encrypt_cv(profile.user_id, profile.cv_text)
             row.cv_filename = profile.cv_filename
             row.profile_hash = p_hash
             row.cv_hash = c_hash
@@ -611,15 +648,14 @@ class OfferRepository:
     # Converters
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _orm_to_profile(row: UserConfigORM) -> UserProfile:
+    def _orm_to_profile(self, row: UserConfigORM) -> UserProfile:
         return UserProfile(
             user_id=row.user_id,
             target_roles=row.target_roles,
             preferred_locations=row.preferred_locations,
             accepted_formats=json.loads(row.accepted_formats_json or "[]"),
             dealbreakers=row.dealbreakers,
-            cv_text=row.cv_text,
+            cv_text=self._decrypt_cv(row.user_id, row.cv_text),
             cv_filename=row.cv_filename,
         )
 

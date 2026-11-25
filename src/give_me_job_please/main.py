@@ -41,10 +41,12 @@ async def run_bot() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    secret_box = SecretBox(settings.encryption_key_bytes())
+
     deps = BotDependencies(
         settings=settings,
-        repo=OfferRepository(session_factory),
-        secret_box=SecretBox(settings.encryption_key_bytes()),
+        repo=OfferRepository(session_factory, secret_box=secret_box),
+        secret_box=secret_box,
         pkce_manager=OpenRouterPkceManager(app_label=settings.openrouter_app_title),
         local_scorer=LocalEmbedderScorer(
             model_name=settings.local_embedding_model,

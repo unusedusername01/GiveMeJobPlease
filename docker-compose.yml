@@ -14,6 +14,17 @@ services:
     volumes:
       - ./data:/app/data
     mem_limit: 1536m
+    # Defense in depth: the bot never needs to gain privileges, spawn helpers,
+    # or write outside /app/data and /tmp.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,noexec,nosuid
+      - /home/appuser/.cache:size=64m,noexec,nosuid
+    pids_limit: 128
     logging:
       driver: "json-file"
       options:
