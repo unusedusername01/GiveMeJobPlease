@@ -13,6 +13,7 @@ import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -61,6 +62,48 @@ Scoring rules:
 - Always include an entry for EVERY uid provided in the batch."""
 
 
+@dataclass(slots=True)
+class BatchUsage:
+    """Per-batch token/cost accounting from OpenRouter's automatic usage object.
+
+    `cost` is None when the provider omits it (e.g. some BYOK routes).
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float | None = None
+
+
+@dataclass(slots=True)
+class ProgressUpdate:
+    """Cumulative run progress emitted after each completed batch."""
+
+    batch_index: int  # 1-based
+    total_batches: int
+    scored_offers: int
+    total_offers: int
+    prompt_tokens: int
+    completion_tokens: int
+    cost: float | None  # cumulative; None if no batch reported a cost
+
+
+def _extract_usage(response: Any) -> BatchUsage:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return BatchUsage()
+
+    def _int(val: Any) -> int:
+        return int(val) if isinstance(val, int | float) else 0
+
+    raw_cost = getattr(usage, "cost", None)
+    cost = float(raw_cost) if isinstance(raw_cost, int | float) else None
+    return BatchUsage(
+        prompt_tokens=_int(getattr(usage, "prompt_tokens", 0)),
+        completion_tokens=_int(getattr(usage, "completion_tokens", 0)),
+        cost=cost,
+    )
+
+
 class _LlmItemResult(BaseModel):
     uid: str
     score: float = Field(ge=0.0, le=10.0)
@@ -106,6 +149,30 @@ def _extract_message_text(response: Any) -> str:
     raise ScorerError("OpenRouter returned an unsupported message content format.")
 
 
+@dataclass(slots=True)
+class KeyUsageInfo:
+    """Key-level spend/limit snapshot from GET /api/v1/key (free, no inference cost)."""
+
+    usage_daily: float
+    limit_remaining: float | None
+
+
+async def fetch_key_usage_info(api_key: str) -> KeyUsageInfo | None:
+    """Best-effort key usage lookup; returns None on any failure (never raises)."""
+    try:
+        async with OpenRouter(api_key=api_key) as client:
+            res = await client.api_keys.get_current_key_metadata_async()
+        data = res.data
+        remaining = getattr(data, "limit_remaining", None)
+        return KeyUsageInfo(
+            usage_daily=float(getattr(data, "usage_daily", 0.0) or 0.0),
+            limit_remaining=float(remaining) if isinstance(remaining, int | float) else None,
+        )
+    except Exception:
+        logger.warning("openrouter_key_usage_lookup_failed")
+        return None
+
+
 class OpenRouterScorer:
     """Batch LLM offer scorer using the official OpenRouter Python SDK."""
 
@@ -134,6 +201,7 @@ class OpenRouterScorer:
         fingerprint: str,
         *,
         on_batch_complete: Callable[[list[OfferScore]], Awaitable[None]] | None = None,
+        on_progress: Callable[[ProgressUpdate], Awaitable[None]] | None = None,
     ) -> list[OfferScore]:
         """Score all offers in compact batches via OpenRouter."""
         if not offers:
@@ -141,13 +209,17 @@ class OpenRouterScorer:
 
         profile_context = profile.render_for_matching(max_cv_chars=5000)
         all_scores: list[OfferScore] = []
+        total_batches = (len(offers) + self._batch_size - 1) // self._batch_size
+        sum_prompt = 0
+        sum_completion = 0
+        sum_cost: float | None = None
 
         async with OpenRouter(
             api_key=self._api_key,
             http_referer=self._app_url,
             x_open_router_title=self._app_title,
         ) as client:
-            for start in range(0, len(offers), self._batch_size):
+            for batch_index, start in enumerate(range(0, len(offers), self._batch_size), start=1):
                 batch = offers[start : start + self._batch_size]
                 logger.info(
                     "openrouter_scoring_batch",
@@ -156,7 +228,7 @@ class OpenRouterScorer:
                     batch_size=len(batch),
                     total=len(offers),
                 )
-                batch_scores = await self._score_single_batch(
+                batch_scores, usage = await self._score_single_batch(
                     client=client,
                     profile_context=profile_context,
                     batch=batch,
@@ -165,6 +237,22 @@ class OpenRouterScorer:
                 all_scores.extend(batch_scores)
                 if on_batch_complete is not None:
                     await on_batch_complete(batch_scores)
+                sum_prompt += usage.prompt_tokens
+                sum_completion += usage.completion_tokens
+                if usage.cost is not None:
+                    sum_cost = (sum_cost or 0.0) + usage.cost
+                if on_progress is not None:
+                    await on_progress(
+                        ProgressUpdate(
+                            batch_index=batch_index,
+                            total_batches=total_batches,
+                            scored_offers=len(all_scores),
+                            total_offers=len(offers),
+                            prompt_tokens=sum_prompt,
+                            completion_tokens=sum_completion,
+                            cost=sum_cost,
+                        )
+                    )
 
         return all_scores
 
@@ -175,7 +263,7 @@ class OpenRouterScorer:
         profile_context: str,
         batch: list[JobOffer],
         fingerprint: str,
-    ) -> list[OfferScore]:
+    ) -> tuple[list[OfferScore], BatchUsage]:
         compact_offers = [
             {
                 "uid": o.uid,
@@ -209,7 +297,7 @@ class OpenRouterScorer:
             {"role": "user", "content": user_payload},
         ]
 
-        raw_content = await self._call_with_retry(client, messages)
+        raw_content, usage = await self._call_with_retry(client, messages)
         parsed = self._parse_batch_json(raw_content)
         by_uid = {item.uid: item for item in parsed.results}
 
@@ -241,13 +329,13 @@ class OpenRouterScorer:
                         tags=[t.strip()[:32] for t in item.tags[:4] if t.strip()],
                     )
                 )
-        return results
+        return results, usage
 
     async def _call_with_retry(
         self,
         client: OpenRouter,
         messages: list[dict[str, str]],
-    ) -> str:
+    ) -> tuple[str, BatchUsage]:
         use_json_mode = True
         max_attempts = 3
 
@@ -262,7 +350,7 @@ class OpenRouterScorer:
                 if use_json_mode:
                     kwargs["response_format"] = {"type": "json_object"}
                 response = await client.chat.send_async(**kwargs)
-                return _extract_message_text(response)
+                return _extract_message_text(response), _extract_usage(response)
             except asyncio.CancelledError:
                 # User-initiated cancellation must never be retried or wrapped as a
                 # ScorerError; propagate so the run unwinds and checkpoints stand.

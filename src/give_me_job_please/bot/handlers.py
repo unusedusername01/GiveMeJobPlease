@@ -77,6 +77,8 @@ from give_me_job_please.core.scoring.local_embedder import (
 from give_me_job_please.core.scoring.openrouter_scorer import (
     OPENROUTER_PROMPT_VERSION,
     OpenRouterScorer,
+    ProgressUpdate,
+    fetch_key_usage_info,
 )
 from give_me_job_please.errors import AppError, AuthError, ParseError, ValidationError
 from give_me_job_please.logging_setup import read_recent_error_logs
@@ -102,6 +104,27 @@ class _ScoringProgress:
 
     total: int = 0
     scored: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float | None = None
+
+
+@dataclass(slots=True)
+class LastRunUsage:
+    """In-memory summary of the most recent OpenRouter scoring run for /status."""
+
+    offers: int
+    prompt_tokens: int
+    completion_tokens: int
+    cost: float | None
+    cancelled: bool
+
+
+_PROGRESS_EDIT_INTERVAL_S = 3.0
+
+
+def _format_cost(cost: float | None) -> str:
+    return f"${cost:.4f}" if cost is not None else "cost n/a"
 
 
 @dataclass(slots=True)
@@ -164,6 +187,8 @@ class BotDependencies:
         self.scoring_locks: dict[int, asyncio.Lock] = {}
         # Active scoring task per user, so /cancel or the 🛑 button can abort a run.
         self.scoring_tasks: dict[int, asyncio.Task[None]] = {}
+        # Most recent OpenRouter run summary per user (in-memory only).
+        self.last_run_usage: dict[int, LastRunUsage] = {}
         # Bounded LRU mapping (chat_id, message_id) -> DigestMessageContext for in-place UX.
         self.digest_contexts: OrderedDict[tuple[int, int], DigestMessageContext] = OrderedDict()
 
@@ -222,12 +247,25 @@ def build_router(deps: BotDependencies) -> Router:
                     progress=progress,
                 )
         except asyncio.CancelledError:
+            if progress.total:
+                deps.last_run_usage[user_id] = LastRunUsage(
+                    offers=progress.scored,
+                    prompt_tokens=progress.prompt_tokens,
+                    completion_tokens=progress.completion_tokens,
+                    cost=progress.cost,
+                    cancelled=True,
+                )
             if status_msg is not None:
+                cost_line = (
+                    f" Spent so far: {_format_cost(progress.cost)}."
+                    if progress.cost is not None
+                    else ""
+                )
                 with contextlib.suppress(Exception):
                     await _safe_edit_text(
                         status_msg,
                         f"🛑 <b>Scoring cancelled</b> — {progress.scored} of {progress.total} "
-                        "offer(s) scored and saved.\n"
+                        f"offer(s) scored and saved.{cost_line}\n"
                         "Run /digest again to resume: only unscored offers are re-billed.",
                     )
             raise
@@ -303,8 +341,48 @@ def build_router(deps: BotDependencies) -> Router:
                     if progress is not None:
                         progress.scored += len(batch_scores)
 
+                last_edit_ts = 0.0
+
+                async def _on_progress(update: ProgressUpdate) -> None:
+                    nonlocal last_edit_ts
+                    if progress is not None:
+                        progress.prompt_tokens = update.prompt_tokens
+                        progress.completion_tokens = update.completion_tokens
+                        progress.cost = update.cost
+                    if status_msg is None:
+                        return
+                    now = asyncio.get_running_loop().time()
+                    is_final = update.batch_index >= update.total_batches
+                    # Throttle in-place edits to respect Telegram flood limits;
+                    # always render the final state.
+                    if not is_final and now - last_edit_ts < _PROGRESS_EDIT_INTERVAL_S:
+                        return
+                    last_edit_ts = now
+                    with contextlib.suppress(Exception):
+                        await _safe_edit_text(
+                            status_msg,
+                            f"⏳ Scoring <b>{update.scored_offers}/{update.total_offers}</b> "
+                            f"· batch {update.batch_index}/{update.total_batches} "
+                            f"· {_format_cost(update.cost)} so far\n"
+                            f"Model: <code>{esc(model_id)}</code>",
+                            reply_markup=build_scoring_cancel_keyboard()
+                            if not is_final
+                            else None,
+                        )
+
                 new_scores = await scorer.score_offers(
-                    profile, to_score, fingerprint, on_batch_complete=_checkpoint
+                    profile,
+                    to_score,
+                    fingerprint,
+                    on_batch_complete=_checkpoint,
+                    on_progress=_on_progress,
+                )
+                deps.last_run_usage[user_id] = LastRunUsage(
+                    offers=len(new_scores),
+                    prompt_tokens=progress.prompt_tokens if progress else 0,
+                    completion_tokens=progress.completion_tokens if progress else 0,
+                    cost=progress.cost if progress else None,
+                    cancelled=False,
                 )
             else:
                 prof_vec, offer_vecs = await deps.repo.load_embedding_cache(
@@ -683,6 +761,29 @@ def build_router(deps: BotDependencies) -> Router:
                     f'\nKey links: <a href="{esc(logs_url)}">Activity</a> · '
                     f'<a href="{esc(settings_url)}">Settings/Revoke</a>'
                 )
+            last_run = deps.last_run_usage.get(uid)
+            if last_run is not None:
+                tokens = last_run.prompt_tokens + last_run.completion_tokens
+                engine_line += (
+                    f"\nLast scoring run: <b>{last_run.offers}</b> offer(s) · "
+                    f"{tokens:,} tokens · {_format_cost(last_run.cost)}"
+                    + (" (cancelled)" if last_run.cancelled else "")
+                )
+            with contextlib.suppress(Exception):
+                api_key = deps.secret_box.decrypt(
+                    or_state.key_enc, associated_data=f"openrouter:{uid}"
+                )
+                key_info = await fetch_key_usage_info(api_key)
+                if key_info is not None:
+                    remaining = (
+                        f"${key_info.limit_remaining:.2f}"
+                        if key_info.limit_remaining is not None
+                        else "unlimited"
+                    )
+                    engine_line += (
+                        f"\nKey spend today: <b>${key_info.usage_daily:.4f}</b> · "
+                        f"remaining: <b>{remaining}</b>"
+                    )
         else:
             engine_line = (
                 f"🧠 <b>Local ONNX (Zero-Key Default)</b>\n"

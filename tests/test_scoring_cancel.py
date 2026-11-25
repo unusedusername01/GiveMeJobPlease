@@ -40,7 +40,7 @@ def _offer(i: int) -> JobOffer:
     )
 
 
-def _llm_response(uids: list[str]) -> Any:
+def _llm_response(uids: list[str], cost: float | None = 0.001) -> Any:
     payload = (
         '{"results": ['
         + ",".join(
@@ -50,7 +50,10 @@ def _llm_response(uids: list[str]) -> Any:
         )
         + "]}"
     )
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=payload))])
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=payload))],
+        usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20, cost=cost),
+    )
 
 
 class _BlockingChat:
