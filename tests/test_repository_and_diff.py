@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
-import pytest
+from pathlib import Path
 
-from give_me_job_please.core.diff import filter_eligible_pool, sort_by_relevance
+import pytest
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
+from sqlalchemy import create_engine, inspect
+
+from give_me_job_please.core.diff import (
+    filter_by_min_score,
+    filter_eligible_pool,
+    parse_min_score_threshold,
+    sort_by_relevance,
+)
 from give_me_job_please.core.models import (
+    EnrichedOffer,
     JobOffer,
     OfferScore,
     OfferStatus,
@@ -13,6 +24,7 @@ from give_me_job_please.core.models import (
     UserProfile,
 )
 from give_me_job_please.core.scoring.base import compute_scoring_fingerprint
+from give_me_job_please.errors import ValidationError
 from give_me_job_please.storage.db import create_engine_and_sessionmaker
 from give_me_job_please.storage.orm import Base
 from give_me_job_please.storage.repository import OfferRepository
@@ -163,3 +175,92 @@ async def test_score_persistence_sorting_and_fingerprint_invalidation() -> None:
         assert fp1 != fp2
     finally:
         await engine.dispose()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_min_score_threshold_persistence_and_hash_invariance() -> None:
+    repo, engine = await _make_repo()
+    try:
+        user_id = 42
+        base_profile = await repo.save_profile(
+            UserProfile(
+                user_id=user_id,
+                target_roles="Systems Security",
+                preferred_locations="Lausanne",
+                min_score_threshold=None,
+            )
+        )
+        hash_before = base_profile.profile_hash()
+
+        updated = await repo.set_min_score_threshold(user_id, 7.5)
+        assert updated.min_score_threshold == 7.5
+        # Display cutoff changes must NEVER invalidate cached LLM scoring fingerprints
+        assert updated.profile_hash() == hash_before
+
+        reloaded = await repo.get_or_create_profile(user_id)
+        assert reloaded.min_score_threshold == 7.5
+        assert reloaded.profile_hash() == hash_before
+
+        cleared = await repo.set_min_score_threshold(user_id, None)
+        assert cleared.min_score_threshold is None
+    finally:
+        await engine.dispose()  # type: ignore[attr-defined]
+
+
+def test_filter_by_min_score_and_threshold_parser() -> None:
+    offers = _sample_offers()
+    enriched = [
+        EnrichedOffer(offer=offers[0], score=8.0),
+        EnrichedOffer(offer=offers[1], score=6.5),
+        EnrichedOffer(
+            offer=JobOffer(
+                uid="isacademia:10003",
+                external_id="10003",
+                title="Unscored Role",
+                company="Mystery",
+            ),
+            score=None,
+        ),
+    ]
+
+    assert len(filter_by_min_score(enriched, None)) == 3
+    assert len(filter_by_min_score(enriched, 0.0)) == 3
+    assert [i.offer.uid for i in filter_by_min_score(enriched, 6.5)] == [
+        "isacademia:10001",
+        "isacademia:10002",
+    ]
+    assert [i.offer.uid for i in filter_by_min_score(enriched, 7.0)] == ["isacademia:10001"]
+
+    assert parse_min_score_threshold("7") == 7.0
+    assert parse_min_score_threshold("6,5") == 6.5
+    assert parse_min_score_threshold("8+") == 8.0
+    assert parse_min_score_threshold("off") is None
+    assert parse_min_score_threshold("0") is None
+    for bad in ("-1", "10.5", "nan", "inf", "high"):
+        with pytest.raises(ValidationError):
+            parse_min_score_threshold(bad)
+
+
+def test_alembic_0002_min_score_threshold_reversible(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_file = tmp_path / "alembic_test.db"
+    db_url = f"sqlite:///{db_file.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+
+    alembic_cfg = AlembicConfig("alembic.ini")
+    alembic_command.upgrade(alembic_cfg, "head")
+
+    sync_engine = create_engine(db_url)
+    try:
+        cols = {c["name"] for c in inspect(sync_engine).get_columns("user_config")}
+        assert "min_score_threshold" in cols
+    finally:
+        sync_engine.dispose()
+
+    alembic_command.downgrade(alembic_cfg, "0001_initial")
+    sync_engine = create_engine(db_url)
+    try:
+        cols_after = {c["name"] for c in inspect(sync_engine).get_columns("user_config")}
+        assert "min_score_threshold" not in cols_after
+    finally:
+        sync_engine.dispose()
+

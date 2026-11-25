@@ -6,7 +6,7 @@ import html
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from give_me_job_please.core.models import EnrichedOffer, OfferStatus
+from give_me_job_please.core.models import EnrichedOffer, OfferStatus, UserProfile
 
 _STATUS_BADGE = {
     OfferStatus.NEW: "🆕",
@@ -128,6 +128,44 @@ def build_pagination_keyboard(
         )
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_threshold_label(threshold: float | None) -> str:
+    """Format a minimum score threshold for display."""
+    if threshold is None or threshold <= 0.0:
+        return "Off (show all)"
+    return f"≥ {threshold:g}/10"
+
+
+def format_profile_summary(profile: UserProfile) -> str:
+    """Render the user's current profile settings and CV status."""
+    cv_line = (
+        f"✅ <code>{esc(profile.cv_filename)}</code> ({len(profile.cv_text)} chars)"
+        if profile.cv_text
+        else "<i>Not uploaded</i> (/cv)"
+    )
+    return (
+        "🧭 <b>Your Profile Settings</b>\n\n"
+        f"• <b>Target roles:</b> {esc(profile.target_roles) if profile.target_roles else '<i>not set</i>'}\n"
+        f"• <b>Preferred locations:</b> {esc(profile.preferred_locations) if profile.preferred_locations else '<i>not set</i>'}\n"
+        f"• <b>Accepted formats:</b> {esc(', '.join(profile.accepted_formats)) if profile.accepted_formats else '<i>Any</i>'}\n"
+        f"• <b>Languages &amp; dealbreakers:</b> {esc(profile.dealbreakers) if profile.dealbreakers else '<i>not set</i>'}\n"
+        f"• <b>Min score threshold:</b> <code>{esc(format_threshold_label(profile.min_score_threshold))}</code>\n"
+        f"• <b>CV:</b> {cv_line}\n\n"
+        "<i>Shortcuts:</i> <code>/profile edit</code> · <code>/profile threshold 7</code> · <code>/profile threshold off</code>"
+    )
+
+
+def build_profile_keyboard() -> InlineKeyboardMarkup:
+    """Inline action buttons attached to the /profile settings view."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✏️ Edit Full Profile", callback_data="prof:edit"),
+                InlineKeyboardButton(text="🎯 Set Score Threshold", callback_data="prof:thresh"),
+            ]
+        ]
+    )
 
 
 def chunk_text(text: str, max_len: int = 3800) -> list[str]:

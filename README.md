@@ -77,7 +77,7 @@ uv run mypy src
 
 ## Telegram Commands
 - `/start` — Verify access & show quick help
-- `/profile` — Guided preference setup (roles, locations, formats, dealbreakers)
+- `/profile` — View current preferences & score threshold (`/profile edit` for the guided wizard, `/profile threshold <0-10|off>` for quick cutoff updates)
 - `/cv` — Upload a `.pdf`, `.txt`, or `.md` CV (or drop it directly in chat) — **anonymised only**
 - `/digest` — Score & view `new` offers (`/digest local` forces offline Mode A)
 - `/browse [all|new|seen|starred|applied|excluded]` — Browse offers sorted by relevance

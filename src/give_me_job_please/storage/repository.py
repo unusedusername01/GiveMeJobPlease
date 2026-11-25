@@ -127,10 +127,28 @@ class OfferRepository:
             row.preferred_locations = profile.preferred_locations
             row.accepted_formats_json = json.dumps(profile.accepted_formats, ensure_ascii=False)
             row.dealbreakers = profile.dealbreakers
+            row.min_score_threshold = profile.min_score_threshold
             row.cv_text = self._encrypt_cv(profile.user_id, profile.cv_text)
             row.cv_filename = profile.cv_filename
             row.profile_hash = p_hash
             row.cv_hash = c_hash
+            row.updated_at = now
+            await session.commit()
+            return self._orm_to_profile(row)
+
+    async def set_min_score_threshold(
+        self,
+        user_id: int,
+        threshold: float | None,
+    ) -> UserProfile:
+        """Update only the display score cutoff without touching profile hashes or embeddings."""
+        async with self._sessions() as session:
+            row = await session.get(UserConfigORM, user_id)
+            now = _utcnow()
+            if row is None:
+                row = UserConfigORM(user_id=user_id, updated_at=now)
+                session.add(row)
+            row.min_score_threshold = threshold
             row.updated_at = now
             await session.commit()
             return self._orm_to_profile(row)
@@ -655,6 +673,7 @@ class OfferRepository:
             preferred_locations=row.preferred_locations,
             accepted_formats=json.loads(row.accepted_formats_json or "[]"),
             dealbreakers=row.dealbreakers,
+            min_score_threshold=row.min_score_threshold,
             cv_text=self._decrypt_cv(row.user_id, row.cv_text),
             cv_filename=row.cv_filename,
         )

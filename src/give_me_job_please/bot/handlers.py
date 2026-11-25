@@ -18,9 +18,12 @@ from give_me_job_please import __version__
 from give_me_job_please.bot.formatting import (
     build_offer_keyboard,
     build_pagination_keyboard,
+    build_profile_keyboard,
     chunk_text,
     esc,
     format_offer_card,
+    format_profile_summary,
+    format_threshold_label,
 )
 from give_me_job_please.config import Settings
 from give_me_job_please.core.auth.crypto import SecretBox
@@ -30,7 +33,11 @@ from give_me_job_please.core.auth.openrouter_pkce import (
     search_openrouter_models,
     verify_openrouter_model_exists,
 )
-from give_me_job_please.core.diff import sort_by_relevance
+from give_me_job_please.core.diff import (
+    filter_by_min_score,
+    parse_min_score_threshold,
+    sort_by_relevance,
+)
 from give_me_job_please.core.exporter import export_csv_bytes, export_descriptions_json_bytes
 from give_me_job_please.core.models import EnrichedOffer, OfferScore, OfferStatus
 from give_me_job_please.core.parsers.cv_parser import parse_cv_bytes
@@ -62,6 +69,8 @@ class ProfileWizard(StatesGroup):
     preferred_locations = State()
     accepted_formats = State()
     dealbreakers = State()
+    min_score_threshold = State()
+    quick_threshold = State()
 
 
 class BotDependencies:
@@ -276,19 +285,47 @@ def build_router(deps: BotDependencies) -> Router:
         )
         ranked = sort_by_relevance(items)
 
-        page_size = deps.settings.digest_page_size
-        total_pages = max(1, math.ceil(len(ranked) / page_size))
-        page = max(0, min(page, total_pages - 1))
-        slice_items = ranked[page * page_size : (page + 1) * page_size]
+        # Apply the user's configured score threshold on discovery views only
+        # (never hide starred/applied/excluded items the user explicitly tracks).
+        profile = await deps.repo.get_or_create_profile(user_id)
+        active_threshold = (
+            profile.min_score_threshold if view in {"new", "all", "seen"} else None
+        )
+        total_before_threshold = len(ranked)
+        if active_threshold is not None:
+            ranked = filter_by_min_score(ranked, active_threshold)
+        hidden_below_threshold = total_before_threshold - len(ranked)
 
         engine_badge = (
             f"🤖 OpenRouter (<code>{esc(model_id)}</code>)"
             if engine == "openrouter"
             else f"🧠 Local ONNX (<code>{esc(model_id)}</code>)"
         )
+
+        if not ranked and active_threshold is not None:
+            await status_notice.edit_text(
+                f"<b>{title}</b>\n"
+                f"No offers scored <b>≥ {active_threshold:g}/10</b> "
+                f"(<b>{hidden_below_threshold}</b> lower-scored offer(s) hidden).\n"
+                f"Engine: {engine_badge}\n\n"
+                "Lower or disable your cutoff with <code>/profile threshold off</code>."
+            )
+            return
+
+        page_size = deps.settings.digest_page_size
+        total_pages = max(1, math.ceil(len(ranked) / page_size))
+        page = max(0, min(page, total_pages - 1))
+        slice_items = ranked[page * page_size : (page + 1) * page_size]
+
+        threshold_note = ""
+        if active_threshold is not None:
+            threshold_note = f" · 🎯 ≥{active_threshold:g}"
+            if hidden_below_threshold > 0:
+                threshold_note += f" ({hidden_below_threshold} hidden)"
+
         await status_notice.edit_text(
             f"<b>{title}</b> — showing <b>{len(slice_items)}</b> of <b>{len(ranked)}</b> "
-            f"(Page {page + 1}/{total_pages})\nEngine: {engine_badge}"
+            f"(Page {page + 1}/{total_pages}){threshold_note}\nEngine: {engine_badge}"
         )
 
         displayed_new_uids: list[str] = []
@@ -334,7 +371,7 @@ def build_router(deps: BotDependencies) -> Router:
             "and drop the file right into this chat.\n"
             "4. Run /digest to review ranked offers.\n\n"
             "<b>Commands:</b>\n"
-            "/profile — Guided preference setup\n"
+            "/profile [edit|threshold &lt;val|off&gt;] — View or update preferences &amp; score threshold\n"
             "/cv — View/upload CV\n"
             "/digest [local] — Ranked new offers (or force offline ONNX)\n"
             "/browse [all|new|seen|starred|applied|excluded]\n"
@@ -391,6 +428,7 @@ def build_router(deps: BotDependencies) -> Router:
             f"<b>Scoring Engine:</b>\n{engine_line}\n\n"
             f"<b>Profile &amp; CV:</b>\n"
             f"Profile configured: {'✅' if profile.is_configured() else '⚠️ Not yet (/profile)'}\n"
+            f"Min score threshold: <code>{esc(format_threshold_label(profile.min_score_threshold))}</code>\n"
             f"CV: {cv_line}\n\n"
             f"<b>Showroom Counts ({stats.total_in_showroom} active):</b>\n"
             f"• Eligible pool: <b>{eligible}</b> (🆕 {stats.new_count} new · 👀 {stats.seen_count} seen)\n"
@@ -424,18 +462,99 @@ def build_router(deps: BotDependencies) -> Router:
         await state.clear()
         await message.answer("Cancelled current setup flow.")
 
-    @router.message(Command("profile"))
-    async def cmd_profile(message: Message, state: FSMContext) -> None:
-        if message.from_user is None:
-            return
-        profile = await deps.repo.get_or_create_profile(message.from_user.id)
+    async def _start_profile_wizard(target_msg: Message, user_id: int, state: FSMContext) -> None:
+        profile = await deps.repo.get_or_create_profile(user_id)
         await state.set_state(ProfileWizard.target_roles)
         current = esc(profile.target_roles) if profile.target_roles else "<i>empty</i>"
-        await message.answer(
-            "🧭 <b>Profile Setup (Step 1/4)</b> — send /cancel anytime or <code>-</code> to keep current.\n\n"
+        await target_msg.answer(
+            "🧭 <b>Profile Setup (Step 1/5)</b> — send /cancel anytime or <code>-</code> to keep current.\n\n"
             f"Current target roles: {current}\n\n"
             "<b>What roles, domains, and tech stack are you targeting?</b>\n"
             "<i>Example: MSc Cybersecurity / Systems / Applied AI Security, Python, Rust, C++, distributed systems</i>"
+        )
+
+    async def _prompt_quick_threshold(target_msg: Message, user_id: int, state: FSMContext) -> None:
+        profile = await deps.repo.get_or_create_profile(user_id)
+        await state.set_state(ProfileWizard.quick_threshold)
+        current = esc(format_threshold_label(profile.min_score_threshold))
+        await target_msg.answer(
+            "🎯 <b>Set Minimum Score Threshold</b> — send /cancel anytime.\n\n"
+            f"Current threshold: <code>{current}</code>\n\n"
+            "Enter a number from <b>0 to 10</b> (e.g. <code>6.5</code> or <code>7</code>) to hide "
+            "lower-scoring offers in /digest and /browse, or send <code>off</code> to show all.\n"
+            "<i>Note: Changing this threshold does not re-run paid LLM scoring.</i>"
+        )
+
+    @router.message(Command("profile"))
+    async def cmd_profile(message: Message, command: CommandObject, state: FSMContext) -> None:
+        if message.from_user is None:
+            return
+        uid = message.from_user.id
+        raw_args = (command.args or "").strip()
+        if not raw_args or raw_args.lower() in {"show", "view"}:
+            profile = await deps.repo.get_or_create_profile(uid)
+            await message.answer(
+                format_profile_summary(profile),
+                reply_markup=build_profile_keyboard(),
+            )
+            return
+
+        parts = raw_args.split(None, 1)
+        subcmd = parts[0].lower()
+        if subcmd == "edit":
+            await _start_profile_wizard(message, uid, state)
+            return
+        if subcmd in {"threshold", "min", "cutoff"}:
+            if len(parts) < 2:
+                await _prompt_quick_threshold(message, uid, state)
+                return
+            threshold = parse_min_score_threshold(parts[1])
+            saved = await deps.repo.set_min_score_threshold(uid, threshold)
+            await message.answer(
+                f"✅ <b>Min score threshold updated to</b> "
+                f"<code>{esc(format_threshold_label(saved.min_score_threshold))}</code>.\n"
+                "<i>Cached offer scores are preserved (no re-scoring needed).</i>"
+            )
+            return
+
+        raise ValidationError(
+            "Usage: /profile (view settings), /profile edit (guided wizard), "
+            "or /profile threshold <0-10|off>."
+        )
+
+    @router.callback_query(F.data == "prof:edit")
+    async def cb_profile_edit(callback: CallbackQuery, state: FSMContext) -> None:
+        if callback.from_user is None or not isinstance(callback.message, Message):
+            return
+        await callback.answer()
+        await _start_profile_wizard(callback.message, callback.from_user.id, state)
+
+    @router.callback_query(F.data == "prof:thresh")
+    async def cb_profile_threshold(callback: CallbackQuery, state: FSMContext) -> None:
+        if callback.from_user is None or not isinstance(callback.message, Message):
+            return
+        await callback.answer()
+        await _prompt_quick_threshold(callback.message, callback.from_user.id, state)
+
+    @router.message(ProfileWizard.quick_threshold)
+    async def profile_step_quick_threshold(message: Message, state: FSMContext) -> None:
+        if message.from_user is None or not message.text:
+            return
+        text = message.text.strip()
+        uid = message.from_user.id
+        if text == "-":
+            profile = await deps.repo.get_or_create_profile(uid)
+            saved = profile
+        else:
+            threshold = parse_min_score_threshold(text)
+            saved = await deps.repo.set_min_score_threshold(uid, threshold)
+        await state.clear()
+        await message.answer(
+            f"✅ <b>Min score threshold set to</b> "
+            f"<code>{esc(format_threshold_label(saved.min_score_threshold))}</code>.\n"
+            "<i>Cached offer scores are preserved (no re-scoring needed).</i>\n\n"
+            f"{format_profile_summary(saved)}",
+            reply_markup=build_profile_keyboard(),
         )
 
     @router.message(ProfileWizard.target_roles)
@@ -448,7 +567,7 @@ def build_router(deps: BotDependencies) -> Router:
         await state.set_state(ProfileWizard.preferred_locations)
         current = esc(profile.preferred_locations) if profile.preferred_locations else "<i>empty</i>"
         await message.answer(
-            "📍 <b>Profile Setup (Step 2/4)</b>\n"
+            "📍 <b>Profile Setup (Step 2/5)</b>\n"
             f"Current locations: {current}\n\n"
             "<b>Preferred locations &amp; remote/relocation tolerance?</b> (comma-separated)\n"
             "<i>Example: Lausanne, Geneva, Zurich, Remote (no relocation outside Switzerland)</i>"
@@ -466,7 +585,7 @@ def build_router(deps: BotDependencies) -> Router:
         await state.set_state(ProfileWizard.accepted_formats)
         current = esc(", ".join(profile.accepted_formats)) if profile.accepted_formats else "<i>any</i>"
         await message.answer(
-            "🏷 <b>Profile Setup (Step 3/4)</b>\n"
+            "🏷 <b>Profile Setup (Step 3/5)</b>\n"
             f"Current accepted formats: {current}\n\n"
             "<b>Which formats do you accept?</b> (comma-separated, or <code>any</code>)\n"
             "<i>Options: Internship, master project or Internship, PDM coordonné</i>"
@@ -488,7 +607,7 @@ def build_router(deps: BotDependencies) -> Router:
         await state.set_state(ProfileWizard.dealbreakers)
         current = esc(profile.dealbreakers) if profile.dealbreakers else "<i>empty</i>"
         await message.answer(
-            "🚫 <b>Profile Setup (Step 4/4)</b>\n"
+            "🚫 <b>Profile Setup (Step 4/5)</b>\n"
             f"Current dealbreakers/languages: {current}\n\n"
             "<b>Languages spoken &amp; hard dealbreakers?</b>\n"
             "<i>Example: Fluent English &amp; French; skip unpaid internships, pure frontend/UI, or PowerBI-only roles.</i>"
@@ -496,6 +615,23 @@ def build_router(deps: BotDependencies) -> Router:
 
     @router.message(ProfileWizard.dealbreakers)
     async def profile_step_dealbreakers(message: Message, state: FSMContext) -> None:
+        if message.from_user is None or not message.text:
+            return
+        profile = await deps.repo.get_or_create_profile(message.from_user.id)
+        text = message.text.strip()
+        await state.update_data(dealbreakers=profile.dealbreakers if text == "-" else text)
+        await state.set_state(ProfileWizard.min_score_threshold)
+        current = esc(format_threshold_label(profile.min_score_threshold))
+        await message.answer(
+            "🎯 <b>Profile Setup (Step 5/5)</b>\n"
+            f"Current min score threshold: <code>{current}</code>\n\n"
+            "<b>Minimum score threshold (0–10) to display in /digest?</b>\n"
+            "<i>Send a number (e.g. <code>6.5</code> or <code>7</code>), <code>off</code> to show all, "
+            "or <code>-</code> to keep current. Does not trigger re-scoring.</i>"
+        )
+
+    @router.message(ProfileWizard.min_score_threshold)
+    async def profile_step_threshold(message: Message, state: FSMContext) -> None:
         if message.from_user is None or not message.text:
             return
         profile = await deps.repo.get_or_create_profile(message.from_user.id)
@@ -507,17 +643,17 @@ def build_router(deps: BotDependencies) -> Router:
             data.get("preferred_locations", profile.preferred_locations)
         )
         profile.accepted_formats = list(data.get("accepted_formats", profile.accepted_formats))
-        profile.dealbreakers = profile.dealbreakers if text == "-" else text
+        profile.dealbreakers = str(data.get("dealbreakers", profile.dealbreakers))
+        if text != "-":
+            profile.min_score_threshold = parse_min_score_threshold(text)
 
         saved = await deps.repo.save_profile(profile)
         await state.clear()
         await message.answer(
-            "✅ <b>Profile saved!</b> (Stale offer scores will automatically re-compute on your next /digest.)\n\n"
-            f"• <b>Roles:</b> {esc(saved.target_roles or '—')}\n"
-            f"• <b>Locations:</b> {esc(saved.preferred_locations or '—')}\n"
-            f"• <b>Formats:</b> {esc(', '.join(saved.accepted_formats) or 'Any')}\n"
-            f"• <b>Dealbreakers:</b> {esc(saved.dealbreakers or '—')}\n\n"
-            "Tip: You can also drop a <code>.pdf</code>, <code>.txt</code>, or <code>.md</code> CV anytime."
+            "✅ <b>Profile saved!</b> (Stale offer scores will automatically re-compute if roles/locations/formats/dealbreakers changed.)\n\n"
+            f"{format_profile_summary(saved)}\n\n"
+            "Tip: You can also drop a <code>.pdf</code>, <code>.txt</code>, or <code>.md</code> CV anytime.",
+            reply_markup=build_profile_keyboard(),
         )
 
     @router.message(Command("cv"))

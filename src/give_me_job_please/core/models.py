@@ -81,6 +81,7 @@ class UserProfile(BaseModel):
     preferred_locations: str = ""
     accepted_formats: list[str] = Field(default_factory=list)
     dealbreakers: str = ""
+    min_score_threshold: float | None = Field(default=None, ge=0.0, le=10.0)
     cv_text: str = ""
     cv_filename: str = ""
 
@@ -93,6 +94,8 @@ class UserProfile(BaseModel):
         )
 
     def profile_hash(self) -> str:
+        # Intentionally excludes `min_score_threshold`: changing a post-scoring
+        # display cutoff must never invalidate cached LLM scores or trigger re-billing.
         payload = "|".join(
             [
                 self.target_roles.strip(),

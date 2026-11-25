@@ -86,6 +86,7 @@ class UserConfigORM(Base):
     preferred_locations: Mapped[str] = mapped_column(Text, nullable=False, default="")
     accepted_formats_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     dealbreakers: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    min_score_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
     cv_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     cv_filename: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     profile_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
