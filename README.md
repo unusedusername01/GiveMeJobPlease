@@ -6,7 +6,8 @@ Personal, self-hosted Telegram bot for parsing, tracking, and ranking **EPFL IS-
 - **Zero-Scraping, Drop-to-Bot Workflow:** Hit `Ctrl+S` on IS-Academia (`Internships showroom (stu).htm` or `Registrations (stu).htm`) and drop the file into your Telegram bot chat.
 - **Pipeline-Ready State Machine:** Tracks `new`, `seen`, `applied`, and `excluded` offers plus an independent `⭐ Star` flag. Eligible pool is always `Current Showroom - Applied - Excluded`, with one-tap toggles to revisit `seen`, `starred`, `applied`, or `excluded` offers.
 - **In-Place Single-Message Telegram UX:** `/digest` and `/browse` render a compact ranked list in a single message edited in-place across **List → Offer Card → Paginated Full Description** (with `Star / Apply / Exclude` directly available in every view), marking `new` offers as `seen` on open or via `👀 Mark page seen` so pagination never skips offers.
-- **Profile + CV Context:** Viewable `/profile` summary with a 5-step guided wizard (including a post-scoring min score threshold that never triggers paid re-scoring) plus `.pdf` / `.txt` / `.md` CV extraction. **Upload an anonymised CV only** — see [Data Handling & CV Privacy Policy](#data-handling--cv-privacy-policy).
+- **Profile + CV Context:** Viewable `/profile` summary with a 5-step guided wizard (including a post-scoring min score threshold that never triggers paid re-scoring) plus `.pdf` / `.txt` / `.md` CV extraction. Each wizard step sends the question first and your **current value as a separate plain-text message** — long-press → Copy, edit, send back. `/cv` likewise shows the extracted text as a copyable plain-text preview. **Upload an anonymised CV only** — see [Data Handling & CV Privacy Policy](#data-handling--cv-privacy-policy).
+- **Cancellable Scoring with Live Progress & Cost:** Long scoring runs show `60/418 · batch 4/28 · $0.0123 so far` (fed by OpenRouter's free per-response usage accounting) with a `🛑 Cancel scoring` button; `/cancel` also stops a run. Completed batches are checkpointed, so cancelling never re-bills finished work — `/digest` resumes where it stopped.
 - **Dual Scoring Engine:**
   - **Mode B (Primary when connected):** Connect OpenRouter via secure headless **OAuth PKCE** (`/connect_openrouter` → `/auth <code>`) to score offers with DeepSeek, Qwen, or any OpenRouter model. Completely overrides local embeddings.
   - **Mode A (Default without API key):** Runs local multilingual ONNX embeddings (`fastembed`) on CPU with zero API keys and displays all eligible matches ranked by cosine similarity.
@@ -87,5 +88,17 @@ uv run mypy src
 - `/model [search_or_id]` — Search OpenRouter catalog or select active model
 - `/disconnect_openrouter` — Wipe stored key and revert to Mode A
 - `/export` — Receive enriched `internships.csv` + `internships_descriptions.json`
-- `/status` — Show versions, active scorer, DB counts, and OpenRouter key links
+- `/cancel` — Stop an active scoring run (completed batches stay saved) or exit the setup wizard
+- `/status` — Show versions, active scorer, DB counts, OpenRouter key links, last-run token/cost summary, and key spend-today / remaining limit
 - `/logs` — Show the last 5 traced error entries
+
+### Cancelling a scoring run
+Tap `🛑 Cancel scoring` on the progress message or send `/cancel`. Notes:
+- Every completed batch is already persisted; the next `/digest` re-scores **only** the
+  offers that never got a score, so cancelled work is not billed twice.
+- A batch already sent to OpenRouter may still be billed server-side even if you cancel
+  while waiting for its response — cancellation cannot un-send an in-flight request.
+- In local Mode A, an in-flight ONNX embedding chunk finishes in its worker thread
+  (it cannot be killed); the run stops right after that chunk.
+- The cost display uses OpenRouter's automatic per-response `usage.cost`; some providers
+  omit it, in which case the bot shows `cost n/a` rather than guessing.

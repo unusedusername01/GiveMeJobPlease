@@ -4,6 +4,23 @@ All notable changes to **GiveMeJobPlease** are documented in this file.
 This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- Cancellable scoring runs: `🛑 Cancel scoring` inline button on the progress message and
+  `/cancel` now also aborts an active run. Completed batches are checkpointed, so a cancelled
+  run resumes via `/digest` without re-billing finished work; the status message reports
+  "X of Y scored and saved". Local ONNX embedding is chunked (64 texts) so cancellation
+  lands between chunks.
+- Live scoring progress + cost meter: per-batch `scored/total · batch i/n · $cost so far`
+  edited in place (throttled ≥3 s), fed by OpenRouter's automatic per-response usage
+  accounting (no extra API cost; `cost n/a` when a provider omits it). `/status` shows the
+  last run's token/cost summary and, best-effort, key spend-today and remaining limit via
+  one free `GET /api/v1/key` call.
+### Changed
+- `/profile edit` wizard steps and the quick-threshold prompt now send two messages:
+  step details first, then the raw current value as plain text for easy copy-edit-send
+  (`-` keeps current, `any` for formats, `off` for threshold).
+- `/cv` shows the extracted CV text (first 3,500 chars) as a separate plain-text message
+  instead of an HTML-escaped inline preview.
 ### Security
 - Dockerfile pins `python:3.12-slim` and `ghcr.io/astral-sh/uv:0.13.10` by image digest
   and runs `uv sync --locked`, so the image installs exactly the reviewed lockfile set
