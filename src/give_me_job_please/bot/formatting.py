@@ -573,6 +573,13 @@ def format_threshold_label(threshold: float | None) -> str:
     return f"≥ {threshold:g}/10"
 
 
+def format_threshold_value(threshold: float | None) -> str:
+    """Plain, directly sendable threshold value for copy-edit wizard messages."""
+    if threshold is None or threshold <= 0.0:
+        return "off"
+    return f"{threshold:g}"
+
+
 def format_profile_summary(profile: UserProfile) -> str:
     """Render the user's current profile settings and CV status."""
     cv_line = (

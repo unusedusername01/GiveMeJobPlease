@@ -41,6 +41,7 @@ from give_me_job_please.bot.formatting import (
     format_profile_summary,
     format_recency_label,
     format_threshold_label,
+    format_threshold_value,
 )
 from give_me_job_please.config import Settings
 from give_me_job_please.core.auth.crypto import SecretBox
@@ -764,27 +765,40 @@ def build_router(deps: BotDependencies) -> Router:
         task.cancel()
         await callback.answer("Cancelling… completed batches are saved.", show_alert=False)
 
+    async def _send_wizard_prompt(
+        target_msg: Message, prompt_html: str, current_plain: str
+    ) -> None:
+        """Two-message wizard prompt: step details first, then the raw current value.
+
+        The second message is plain text (no HTML) so long-press → Copy in Telegram
+        yields exactly the editable value.
+        """
+        await target_msg.answer(prompt_html)
+        await target_msg.answer(current_plain, parse_mode=None)
+
     async def _start_profile_wizard(target_msg: Message, user_id: int, state: FSMContext) -> None:
         profile = await deps.repo.get_or_create_profile(user_id)
         await state.set_state(ProfileWizard.target_roles)
-        current = esc(profile.target_roles) if profile.target_roles else "<i>empty</i>"
-        await target_msg.answer(
+        await _send_wizard_prompt(
+            target_msg,
             "🧭 <b>Profile Setup (Step 1/5)</b> — send /cancel anytime or <code>-</code> to keep current.\n\n"
-            f"Current target roles: {current}\n\n"
             "<b>What roles, domains, and tech stack are you targeting?</b>\n"
-            "<i>Example: MSc Cybersecurity / Systems / Applied AI Security, Python, Rust, C++, distributed systems</i>"
+            "<i>Example: MSc Cybersecurity / Systems / Applied AI Security, Python, Rust, C++, distributed systems</i>\n\n"
+            "Your current value is in the next message — copy, edit, and send it back.",
+            profile.target_roles or "-",
         )
 
     async def _prompt_quick_threshold(target_msg: Message, user_id: int, state: FSMContext) -> None:
         profile = await deps.repo.get_or_create_profile(user_id)
         await state.set_state(ProfileWizard.quick_threshold)
-        current = esc(format_threshold_label(profile.min_score_threshold))
-        await target_msg.answer(
+        await _send_wizard_prompt(
+            target_msg,
             "🎯 <b>Set Minimum Score Threshold</b> — send /cancel anytime.\n\n"
-            f"Current threshold: <code>{current}</code>\n\n"
             "Enter a number from <b>0 to 10</b> (e.g. <code>6.5</code> or <code>7</code>) to hide "
             "lower-scoring offers in /digest and /browse, or send <code>off</code> to show all.\n"
-            "<i>Note: Changing this threshold does not re-run paid LLM scoring.</i>"
+            "<i>Note: Changing this threshold does not re-run paid LLM scoring.</i>\n\n"
+            "Your current value is in the next message — copy, edit, and send it back.",
+            format_threshold_value(profile.min_score_threshold),
         )
 
     @router.message(Command("profile"))
@@ -867,12 +881,14 @@ def build_router(deps: BotDependencies) -> Router:
         text = message.text.strip()
         await state.update_data(target_roles=profile.target_roles if text == "-" else text)
         await state.set_state(ProfileWizard.preferred_locations)
-        current = esc(profile.preferred_locations) if profile.preferred_locations else "<i>empty</i>"
-        await message.answer(
+        await _send_wizard_prompt(
+            message,
             "📍 <b>Profile Setup (Step 2/5)</b>\n"
-            f"Current locations: {current}\n\n"
             "<b>Preferred locations &amp; remote/relocation tolerance?</b> (comma-separated)\n"
-            "<i>Example: Lausanne, Geneva, Zurich, Remote (no relocation outside Switzerland)</i>"
+            "<i>Example: Lausanne, Geneva, Zurich, Remote (no relocation outside Switzerland)</i>\n\n"
+            "Your current value is in the next message — copy, edit, and send it back "
+            "(or <code>-</code> to keep it).",
+            profile.preferred_locations or "-",
         )
 
     @router.message(ProfileWizard.preferred_locations)
@@ -885,12 +901,14 @@ def build_router(deps: BotDependencies) -> Router:
             preferred_locations=profile.preferred_locations if text == "-" else text
         )
         await state.set_state(ProfileWizard.accepted_formats)
-        current = esc(", ".join(profile.accepted_formats)) if profile.accepted_formats else "<i>any</i>"
-        await message.answer(
+        await _send_wizard_prompt(
+            message,
             "🏷 <b>Profile Setup (Step 3/5)</b>\n"
-            f"Current accepted formats: {current}\n\n"
             "<b>Which formats do you accept?</b> (comma-separated, or <code>any</code>)\n"
-            "<i>Options: Internship, master project or Internship, PDM coordonné</i>"
+            "<i>Options: Internship, master project or Internship, PDM coordonné</i>\n\n"
+            "Your current value is in the next message — copy, edit, and send it back "
+            "(or <code>-</code> to keep it).",
+            ", ".join(profile.accepted_formats) if profile.accepted_formats else "any",
         )
 
     @router.message(ProfileWizard.accepted_formats)
@@ -907,12 +925,14 @@ def build_router(deps: BotDependencies) -> Router:
             formats = [p.strip() for p in text.split(",") if p.strip()]
         await state.update_data(accepted_formats=formats)
         await state.set_state(ProfileWizard.dealbreakers)
-        current = esc(profile.dealbreakers) if profile.dealbreakers else "<i>empty</i>"
-        await message.answer(
+        await _send_wizard_prompt(
+            message,
             "🚫 <b>Profile Setup (Step 4/5)</b>\n"
-            f"Current dealbreakers/languages: {current}\n\n"
             "<b>Languages spoken &amp; hard dealbreakers?</b>\n"
-            "<i>Example: Fluent English &amp; French; skip unpaid internships, pure frontend/UI, or PowerBI-only roles.</i>"
+            "<i>Example: Fluent English &amp; French; skip unpaid internships, pure frontend/UI, or PowerBI-only roles.</i>\n\n"
+            "Your current value is in the next message — copy, edit, and send it back "
+            "(or <code>-</code> to keep it).",
+            profile.dealbreakers or "-",
         )
 
     @router.message(ProfileWizard.dealbreakers)
@@ -923,13 +943,14 @@ def build_router(deps: BotDependencies) -> Router:
         text = message.text.strip()
         await state.update_data(dealbreakers=profile.dealbreakers if text == "-" else text)
         await state.set_state(ProfileWizard.min_score_threshold)
-        current = esc(format_threshold_label(profile.min_score_threshold))
-        await message.answer(
+        await _send_wizard_prompt(
+            message,
             "🎯 <b>Profile Setup (Step 5/5)</b>\n"
-            f"Current min score threshold: <code>{current}</code>\n\n"
             "<b>Minimum score threshold (0–10) to display in /digest?</b>\n"
             "<i>Send a number (e.g. <code>6.5</code> or <code>7</code>), <code>off</code> to show all, "
-            "or <code>-</code> to keep current. Does not trigger re-scoring.</i>"
+            "or <code>-</code> to keep current. Does not trigger re-scoring.</i>\n\n"
+            "Your current value is in the next message — copy, edit, and send it back.",
+            format_threshold_value(profile.min_score_threshold),
         )
 
     @router.message(ProfileWizard.min_score_threshold)
